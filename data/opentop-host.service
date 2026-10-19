@@ -1,0 +1,12 @@
+[Unit]
+Description=opentop: virtueller Monitor für opentop-clients
+PartOf=graphical-session.target
+After=graphical-session.target xdg-desktop-portal.service
+
+[Service]
+ExecStart=%h/.local/bin/opentop-host
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

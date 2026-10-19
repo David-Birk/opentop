@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=opentop
+GenericName=Zweiter Monitor
+Comment=Anderen Laptop als zweiten Bildschirm verwenden (an/aus)
+Exec=sh -c 'if systemctl --user is-active -q opentop-host; then systemctl --user stop opentop-host; notify-send -i video-display opentop "Zweiter Monitor aus"; else systemctl --user start opentop-host; notify-send -i video-display opentop "Wartet auf zweiten Laptop"; fi'
+Icon=video-display
+Type=Application
+Categories=System;Utility;

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=opentop (Zweiter Monitor)
+Comment=Dieser Laptop dient nur als zweiter Bildschirm für einen opentop-host
+Exec=env XCURSOR_PATH=/usr/share/opentop/icons XCURSOR_THEME=default cage -s -d -- systemd-cat -t opentop-client /usr/local/bin/opentop-client
+Type=Application
+DesktopNames=opentop

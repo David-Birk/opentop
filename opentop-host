@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""opentop-host: legt in KDE Plasma einen virtuellen Monitor an und streamt ihn
+per H.264/RTP an einen opentop-client im LAN.
+
+Der Client meldet sich per UDP-Broadcast. Sobald er auftaucht, wird der
+virtuelle Monitor erzeugt; verschwindet er, wird der Monitor wieder entfernt.
+"""
+import argparse
+import ipaddress
+import json
+import os
+import queue
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstVideo", "1.0")
+from gi.repository import GLib, Gst, GstVideo
+
+BEACON_PORT = 47800
+STREAM_PORT = 47801
+CLIENT_TIMEOUT = 6
+PACING_BITRATE = 80_000_000
+PACING_BURST = 16 * 1024
+KEYFRAME_MIN_INTERVAL = 0.3
+VIRTUAL_WIDTH = 1920  # KDE legt virtuelle Monitore fest mit 1920x1080 an
+LINK_LOCAL = ipaddress.ip_network("169.254.0.0/16")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "opentop")
+TOKEN_FILE = os.path.join(CONFIG_DIR, "restore_token")
+
+PORTAL_BUS = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+SOURCE_VIRTUAL = 4
+CURSOR_EMBEDDED = 2
+PERSIST_UNTIL_REVOKED = 2
+
+
+def log(*args):
+    print("[opentop]", *args, flush=True)
+
+
+def notify(bus, summary, body=""):
+    try:
+        obj = bus.get_object("org.freedesktop.Notifications", "/org/freedesktop/Notifications")
+        dbus.Interface(obj, "org.freedesktop.Notifications").Notify(
+            "opentop", 0, "video-display", summary, body, [], {}, 3000)
+    except dbus.DBusException:
+        pass
+
+
+class VirtualScreen:
+    """ScreenCast-Portal-Sitzung mit einem virtuellen Monitor als Quelle."""
+
+    def __init__(self, bus):
+        self.bus = bus
+        portal = bus.get_object(PORTAL_BUS, PORTAL_PATH)
+        self.screencast = dbus.Interface(portal, "org.freedesktop.portal.ScreenCast")
+        self.sender = bus.get_unique_name()[1:].replace(".", "_")
+        self.counter = 0
+        self.session = None
+
+    def _call(self, method, *args, options, on_response):
+        self.counter += 1
+        token = f"opentop{os.getpid()}_{self.counter}"
+        path = f"{PORTAL_PATH}/request/{self.sender}/{token}"
+
+        def handler(code, results):
+            match.remove()
+            on_response(int(code), results)
+
+        match = self.bus.add_signal_receiver(
+            handler, "Response", "org.freedesktop.portal.Request", PORTAL_BUS, path)
+        options["handle_token"] = token
+        getattr(self.screencast, method)(*args, dbus.Dictionary(options, signature="sv"))
+
+    def open(self, on_ready, on_error):
+        def created(code, results):
+            if code != 0:
+                return on_error(f"CreateSession abgelehnt ({code})")
+            self.session = str(results["session_handle"])
+            options = {
+                "types": dbus.UInt32(SOURCE_VIRTUAL),
+                "cursor_mode": dbus.UInt32(CURSOR_EMBEDDED),
+                "persist_mode": dbus.UInt32(PERSIST_UNTIL_REVOKED),
+                "multiple": dbus.Boolean(False),
+            }
+            token = self._load_token()
+            if token:
+                options["restore_token"] = token
+            self._call("SelectSources", self.session, options=options, on_response=selected)
+
+        def selected(code, _results):
+            if code != 0:
+                return on_error(f"SelectSources abgelehnt ({code})")
+            self._call("Start", self.session, "", options={}, on_response=started)
+
+        def started(code, results):
+            if code != 0:
+                return on_error(f"Start abgelehnt ({code})")
+            if "restore_token" in results:
+                self._save_token(str(results["restore_token"]))
+            node_id = int(results["streams"][0][0])
+            fd = self.screencast.OpenPipeWireRemote(
+                self.session, dbus.Dictionary({}, signature="sv")).take()
+            on_ready(fd, node_id)
+
+        self._call("CreateSession", options={"session_handle_token": f"opentop{os.getpid()}"},
+                   on_response=created)
+
+    def close(self):
+        if not self.session:
+            return
+        try:
+            obj = self.bus.get_object(PORTAL_BUS, self.session)
+            dbus.Interface(obj, "org.freedesktop.portal.Session").Close()
+        except dbus.DBusException as e:
+            log("Session.Close fehlgeschlagen:", e)
+        self.session = None
+
+    @staticmethod
+    def _load_token():
+        try:
+            with open(TOKEN_FILE) as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
+
+    @staticmethod
+    def _save_token(token):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(TOKEN_FILE, "w") as f:
+            f.write(token)
+
+
+def has_element(name):
+    return Gst.ElementFactory.find(name) is not None
+
+
+class Pacer:
+    """Verschickt RTP-Pakete gleichmäßig verteilt statt als Burst pro Bild.
+
+    Ein Keyframe sind schnell über 100 Pakete; mit 1 Gbit/s am Stück
+    rausgeschickt laufen die Puffer billiger Switches vor Clients mit
+    100-Mbit-Anschluss über, und es fehlen Teile des Bildes.
+    """
+
+    def __init__(self, ip):
+        self.ip = ip
+        self.queue = queue.Queue()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def on_sample(self, sink):
+        buf = sink.emit("pull-sample").get_buffer()
+        self.queue.put(buf.extract_dup(0, buf.get_size()))
+        return Gst.FlowReturn.OK
+
+    def run(self):
+        rate = PACING_BITRATE / 8
+        tokens, last = PACING_BURST, time.perf_counter()
+        while (data := self.queue.get()) is not None:
+            now = time.perf_counter()
+            tokens = min(PACING_BURST, tokens + (now - last) * rate)
+            last = now
+            if tokens < len(data):
+                time.sleep((len(data) - tokens) / rate)
+                tokens, last = len(data), time.perf_counter()
+            tokens -= len(data)
+            try:
+                self.sock.sendto(data, (self.ip, STREAM_PORT))
+            except OSError:
+                pass
+
+    def close(self):
+        self.queue.put(None)
+
+
+def build_pipeline(fd, node_id, client_ip, size, args):
+    # path= nimmt die Node-ID (target-object erwartet die Serial). Ohne
+    # dont-fallback weicht PipeWire sonst still auf die Webcam aus.
+    src = (f"pipewiresrc name=src fd={fd} path={node_id} "
+           "stream-properties=\"props,node.dont-fallback=true,node.dont-reconnect=true\" "
+           f"do-timestamp=true keepalive-time=500 ! videorate drop-only=true max-rate={args.fps}")
+    # Auf die Panel-Auflösung des Clients skalieren: spart Bandbreite und
+    # nimmt schwachen Clients das Herunterskalieren ab.
+    dims = f",width={size[0]},height={size[1]}" if size else ""
+    if has_element("vah264enc") and not args.software:
+        # KWin liefert DMABufs, die vapostproc nicht direkt importieren kann.
+        enc = (f"video/x-raw ! videoconvertscale n-threads=4 ! video/x-raw,format=NV12{dims} ! "
+               f"vah264enc bitrate={args.bitrate} key-int-max={args.fps} b-frames=0 "
+               "rate-control=vbr target-usage=7")
+    else:
+        enc = (f"videoconvertscale n-threads=4 ! video/x-raw,format=I420{dims} ! "
+               f"x264enc tune=zerolatency speed-preset=ultrafast bitrate={args.bitrate} "
+               f"key-int-max={args.fps}")
+    sink = (f"h264parse config-interval=-1 ! rtph264pay config-interval=-1 pt=96 mtu=1400 ! "
+            "appsink name=out emit-signals=true sync=false async=false")
+    desc = f"{src} ! {enc} ! {sink}"
+    log("Pipeline:", desc)
+    return Gst.parse_launch(desc)
+
+
+def set_virtual_scale(client_width):
+    # Logische Größe des virtuellen Monitors an das Client-Panel angleichen,
+    # damit Schrift dort so groß ist wie auf einem nativen Display.
+    out = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True).stdout
+    match = re.search(r"Output: \S+ (Virtual-\S+)", re.sub(r"\x1b\[[0-9;]*m", "", out))
+    if not match:
+        return
+    scale = max(1.0, round(VIRTUAL_WIDTH / client_width * 20) / 20)
+    log(f"Skalierung von {match[1]} auf {scale:g}")
+    subprocess.Popen(["kscreen-doctor", f"output.{match[1]}.scale.{scale:g}"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def is_direct_link(ip):
+    # Kabelverbindungen (Thunderbolt/USB) laufen über IPv4-Link-Local.
+    return ipaddress.ip_address(ip) in LINK_LOCAL
+
+
+class Host:
+    def __init__(self, args):
+        self.args = args
+        self.bus = dbus.SessionBus()
+        self.screen = None
+        self.pipeline = None
+        self.pacer = None
+        self.client_ip = None
+        self.client_size = None
+        self.peers = {}
+        self.retry_at = 0.0
+        self.last_keyframe = 0.0
+        self.frames = 0
+        self.backoff = 0
+
+    def run(self):
+        if self.args.client:
+            self.start(self.args.client)
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", BEACON_PORT))
+            GLib.io_add_watch(sock.fileno(), GLib.IO_IN, self.on_beacon, sock)
+            GLib.timeout_add_seconds(1, self.check_timeout)
+            log(f"Warte auf opentop-client (UDP {BEACON_PORT}) ...")
+        GLib.MainLoop().run()
+
+    def on_beacon(self, _fd, _cond, sock):
+        data, (ip, _port) = sock.recvfrom(1024)
+        try:
+            msg = json.loads(data)
+        except ValueError:
+            return True
+        if msg.get("opentop") != 1:
+            return True
+        if self.args.allow and ip not in self.args.allow and msg.get("name") not in self.args.allow:
+            return True
+        if ip not in self.peers:
+            log(f"Client {msg.get('name', ip)} erreichbar über {ip}")
+        self.peers[ip] = time.monotonic()
+        if msg.get("keyframe") and ip == self.client_ip:
+            self.request_keyframe()
+        size = tuple(msg["size"]) if msg.get("size") else None
+        if size != self.client_size:
+            self.client_size = size
+            if self.pipeline:
+                log(f"Client-Auflösung jetzt {size}, starte Stream neu")
+                self.stop(quiet=True)
+        self.update_target()
+        return True
+
+    def check_timeout(self):
+        now = time.monotonic()
+        for ip, seen in list(self.peers.items()):
+            if now - seen > CLIENT_TIMEOUT:
+                log(f"{ip} nicht mehr erreichbar")
+                del self.peers[ip]
+        self.update_target()
+        return True
+
+    def update_target(self):
+        # Kabel vor WLAN; bei Gleichstand beim aktuellen Weg bleiben.
+        best = max(self.peers, key=lambda ip: (is_direct_link(ip), ip == self.client_ip),
+                   default=None)
+        if best is None:
+            if self.client_ip:
+                log("Client weg, beende virtuellen Monitor")
+                self.stop()
+        elif self.client_ip is None:
+            if time.monotonic() >= self.retry_at:
+                self.start(best)
+        elif best != self.client_ip:
+            self.retarget(best)
+
+    def retarget(self, ip):
+        log(f"Wechsle Verbindung {self.client_ip} -> {ip}")
+        self.client_ip = ip
+        if self.pipeline:
+            self.pacer.ip = ip
+            self.request_keyframe()
+            notify(self.bus, "Zweiter Monitor", "über Kabel" if is_direct_link(ip) else "über Netzwerk")
+
+    def request_keyframe(self):
+        # Der Client meldet Paketverlust oder fehlendes Bild; ohne neuen
+        # Keyframe bleiben Artefakte sonst bis zum nächsten GOP stehen.
+        now = time.monotonic()
+        if not self.pipeline or now - self.last_keyframe < KEYFRAME_MIN_INTERVAL:
+            return
+        self.last_keyframe = now
+        self.pipeline.get_by_name("out").send_event(
+            GstVideo.video_event_new_upstream_force_key_unit(Gst.CLOCK_TIME_NONE, True, 0))
+
+    def count_frame(self, _pad, _info):
+        self.frames += 1
+        return Gst.PadProbeReturn.OK
+
+    def log_stats(self, pipeline):
+        if pipeline is not self.pipeline:
+            return False
+        log(f"Statistik 5s: {self.frames} Bilder von KWin")
+        self.frames = 0
+        return True
+
+    def start(self, ip):
+        self.client_ip = ip
+        self.screen = VirtualScreen(self.bus)
+        self.screen.open(self.on_ready, self.on_error)
+
+    def on_ready(self, fd, node_id):
+        ip = self.client_ip
+        self.pipeline = build_pipeline(fd, node_id, ip, self.client_size, self.args)
+        self.pacer = Pacer(ip)
+        self.pipeline.get_by_name("out").connect("new-sample", self.pacer.on_sample)
+        if self.client_size and not self.args.no_autoscale:
+            set_virtual_scale(self.client_size[0])
+        src_pad = self.pipeline.get_by_name("src").get_static_pad("src")
+        src_pad.add_probe(Gst.PadProbeType.BUFFER, self.count_frame)
+        src_pad.connect("notify::caps", lambda pad, _: pad.get_current_caps() and
+                        log("Von KWin:", pad.get_current_caps().to_string()))
+        GLib.timeout_add_seconds(5, self.log_stats, self.pipeline)
+        self.pipeline.get_bus().add_signal_watch()
+        self.pipeline.get_bus().connect("message::error", self.on_pipeline_error)
+        self.pipeline.set_state(Gst.State.PLAYING)
+        log(f"Streame virtuellen Monitor an {ip}:{STREAM_PORT}")
+        GLib.timeout_add_seconds(3, self.on_stable, self.pipeline)
+
+    def on_stable(self, pipeline):
+        # Erst melden, wenn der Stream ein paar Sekunden ohne Fehler läuft.
+        if pipeline is self.pipeline:
+            self.backoff = 0
+            notify(self.bus, "Zweiter Monitor verbunden",
+                   "über Kabel" if is_direct_link(self.client_ip) else f"über Netzwerk ({self.client_ip})")
+        return False
+
+    def on_error(self, reason):
+        self.backoff = min(self.backoff * 2 or 2, 60)
+        log(f"Fehler: {reason} - neuer Versuch in {self.backoff}s")
+        self.stop(quiet=True)
+        self.retry_at = time.monotonic() + self.backoff
+        if self.args.client:
+            GLib.timeout_add_seconds(self.backoff, lambda: self.start(self.args.client) and False)
+
+    def on_pipeline_error(self, _bus, msg):
+        err, dbg = msg.parse_error()
+        self.on_error(f"{err.message} ({dbg})")
+
+    def stop(self, quiet=False):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+            self.pacer.close()
+            if not quiet:
+                notify(self.bus, "Zweiter Monitor getrennt")
+        if self.screen:
+            self.screen.close()
+            self.screen = None
+        self.client_ip = None
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--client", help="Client-IP fest vorgeben statt Auto-Erkennung (z.B. über Tailscale)")
+    p.add_argument("--bitrate", type=int, default=10000, help="kbit/s (Standard: 10000)")
+    p.add_argument("--fps", type=int, default=60)
+    p.add_argument("--software", action="store_true", help="x264 statt VA-API verwenden")
+    p.add_argument("--allow", action="append",
+                   help="nur diesen Client (Hostname oder IP) akzeptieren, mehrfach möglich")
+    p.add_argument("--no-autoscale", action="store_true",
+                   help="Skalierung des virtuellen Monitors nicht anpassen")
+    args = p.parse_args()
+
+    DBusGMainLoop(set_as_default=True)
+    Gst.init(None)
+    host = Host(args)
+    try:
+        host.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        host.stop()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
