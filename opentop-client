@@ -3,6 +3,8 @@
 
 Meldet sich jede Sekunde per UDP-Broadcast, damit der Host den Monitor
 automatisch anlegt. Gedacht für den Start in einer cage-Sitzung (Kiosk).
+Beim ersten Kontakt koppelt er sich mit dem Host über einen 6-stelligen Code,
+der auf beiden Seiten angezeigt und am Host bestätigt wird.
 Ohne Verbindung zeigt er einen Wartebildschirm; Strg+Alt+Rücktaste beendet
 ihn und damit die Sitzung, sodass SDDM wieder die Anmeldung anzeigt.
 """
@@ -11,10 +13,14 @@ import glob
 import json
 import math
 import os
+import secrets
 import socket
 import subprocess
 import sys
 import time
+
+sys.path[:0] = [os.path.dirname(os.path.realpath(__file__)), "/usr/local/share/opentop"]
+import opentop_proto as proto
 
 import cairo  # noqa: F401  (für Cairo-Kontexte in Gtk.DrawingArea)
 import gi
@@ -25,9 +31,10 @@ gi.require_version("GstRtp", "1.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, GLib, Gst, GstRtp, Gtk
 
-BEACON_PORT = 47800
-STREAM_PORT = 47801
 STALL_TIMEOUT = 3
+REJECT_PAUSE = 60
+CONFIG_FILE = os.path.join(proto.CONFIG_DIR, "client.json")
+KEY_FILE = os.path.join(proto.CONFIG_DIR, "client.key")
 QUIT_HINT = "Strg + Alt + Rücktaste  –  zurück zur Anmeldung"
 CREDITS = "developed by David-Birk  ·  github.com/David-Birk"
 
@@ -36,6 +43,8 @@ window, .splash { background: #101318; color: #e6e9ef; }
 .title { font-size: 64px; font-weight: 800; letter-spacing: 2px; }
 .status { font-size: 22px; color: #9aa4b2; }
 .address { font-size: 18px; color: #6c7686; font-family: monospace; }
+.code { font-size: 72px; font-weight: 700; font-family: monospace; color: #e6e9ef;
+        letter-spacing: 6px; }
 .hint { font-size: 14px; color: #4f5866; }
 .credits { font-size: 14px; color: #5f6a7a; }
 """
@@ -92,6 +101,15 @@ class Client:
         self.size = screen_size()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.identity = proto.Identity(KEY_FILE)
+        self.config = proto.load_json(CONFIG_FILE, {})
+        if "id" not in self.config:
+            self.config["id"] = secrets.token_hex(8)
+            proto.save_json(CONFIG_FILE, self.config)
+        self.pairing = None
+        self.pending_keys = []
+        self.repair = False
+        self.rejected_until = 0.0
 
     def run(self):
         self.app = Gtk.Application(application_id="io.github.davidbirk.opentop")
@@ -118,7 +136,9 @@ class Client:
         self.window.fullscreen()
         self.window.present()
 
-        self.start_pipeline()
+        if self.paired:
+            self.start_pipeline()
+        GLib.io_add_watch(self.sock.fileno(), GLib.IO_IN, self.on_message)
         self.send_beacon()
         self.update_splash()
         GLib.timeout_add_seconds(1, self.send_beacon)
@@ -138,11 +158,13 @@ class Client:
         self.status = Gtk.Label()
         self.status.add_css_class("status")
         row.append(self.status)
+        self.code = Gtk.Label(visible=False)
+        self.code.add_css_class("code")
         self.address = Gtk.Label(justify=Gtk.Justification.CENTER)
         self.address.add_css_class("address")
         hint = Gtk.Label(label=QUIT_HINT, margin_top=40)
         hint.add_css_class("hint")
-        for widget in (title, row, self.address, hint):
+        for widget in (title, row, self.code, self.address, hint):
             box.append(widget)
         credits = Gtk.Label(label=CREDITS, valign=Gtk.Align.END, margin_bottom=28)
         credits.add_css_class("credits")
@@ -171,8 +193,23 @@ class Client:
         cr.stroke()
 
     def update_splash(self):
-        receiving = time.monotonic() - self.last_buffer < 1
-        self.status.set_label("Verbinde …" if receiving else "Warte auf den Host …")
+        now = time.monotonic()
+        code = self.pairing and self.pairing.get("code")
+        if code:
+            status = "Kopplungscode – bitte am Host bestätigen"
+        elif self.pairing:
+            status = "Kopplung wird vorbereitet …"
+        elif now < self.rejected_until:
+            status = "Kopplung wurde am Host abgelehnt"
+        elif not self.paired or self.repair:
+            status = "Nicht gekoppelt – warte auf einen opentop-Host …"
+        elif now - self.last_buffer < 1:
+            status = "Verbinde …"
+        else:
+            status = f"Warte auf {self.config['host']['name']} …"
+        self.status.set_label(status)
+        self.code.set_label(code or "")
+        self.code.set_visible(bool(code))
         ips = [a["local"] for a in ipv4_addresses()]
         self.address.set_label(f"{self.name}\n{'  ·  '.join(ips) or 'kein Netzwerk'}")
         return True
@@ -181,27 +218,125 @@ class Client:
         mods = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK
         if keyval == Gdk.KEY_BackSpace and state & mods == mods:
             log("Beendet per Tastenkombination")
-            self.pipeline.set_state(Gst.State.NULL)
+            if self.pipeline:
+                self.pipeline.set_state(Gst.State.NULL)
             self.app.quit()
             return True
         return False
 
+    @property
+    def paired(self):
+        return "host" in self.config
+
     def send_beacon(self, keyframe=False):
+        now = time.monotonic()
+        if self.pairing and now - self.pairing["started"] > proto.PAIRING_TIMEOUT:
+            log("Kopplung abgelaufen")
+            self.pairing = None
+            self.update_splash()
+        ident = {"id": self.config["id"], "name": self.name}
+        if self.paired and not self.repair:
+            host = self.config["host"]
+            msg = proto.sign({"type": "beacon", **ident, "size": self.size, "keyframe": keyframe,
+                              "host": host["pub"], "seq": time.time_ns()},
+                             proto.unb64(host["key"]))
+        elif self.pairing:
+            msg = {"type": "nonce", "id": self.config["id"], "nonce": self.pairing["nonce"]}
+        elif now >= self.rejected_until:
+            msg = {"type": "hello", **ident, "pub": self.identity.pub}
+        else:
+            return True
+        self.broadcast(proto.encode(msg))
+        return True
+
+    def broadcast(self, data):
         # Über jedes Interface melden, damit der Host ein direktes Kabel
         # (Thunderbolt/USB) parallel zum WLAN sieht und bevorzugen kann.
-        msg = json.dumps({"opentop": 1, "name": self.name, "size": self.size,
-                          "keyframe": keyframe}).encode()
         for target in self.args.host or broadcast_addresses():
             try:
-                self.sock.sendto(msg, (target, BEACON_PORT))
+                self.sock.sendto(data, (target, proto.BEACON_PORT))
             except OSError as e:
-                log(f"Beacon an {target} fehlgeschlagen:", e)
+                log(f"Senden an {target} fehlgeschlagen:", e)
+
+    def on_message(self, _fd, _cond):
+        data, addr = self.sock.recvfrom(2048)
+        msg = proto.decode(data)
+        handler = msg and {"commit": self.on_commit, "reveal": self.on_reveal,
+                           "paired": self.on_paired, "rejected": self.on_rejected,
+                           "unknown": self.on_unknown}.get(msg.get("type"))
+        if handler:
+            try:
+                handler(msg, addr)
+            except (KeyError, TypeError, ValueError) as e:
+                log(f"Ungültige Nachricht von {addr[0]}:", e)
         return True
+
+    def on_commit(self, msg, addr):
+        if self.pairing or (self.paired and not self.repair):
+            return
+        log(f"Kopplung mit Host {addr[0]} beginnt")
+        self.pairing = {"host_pub": msg["pub"], "commit": msg["commit"],
+                        "nonce": proto.new_nonce(), "started": time.monotonic()}
+        self.send_beacon()
+        self.update_splash()
+
+    def on_reveal(self, msg, _addr):
+        pairing = self.pairing
+        if not pairing or "code" in pairing:
+            return
+        host_pub, host_nonce = pairing["host_pub"], msg["nonce"]
+        if proto.commitment(host_pub, self.identity.pub, host_nonce) != pairing["commit"]:
+            log("Host hat seine Festlegung gebrochen - Kopplung abgebrochen")
+            self.pairing = None
+            return
+        shared = self.identity.shared(host_pub)
+        args = (shared, host_pub, self.identity.pub, pairing["nonce"], host_nonce)
+        pairing["code"] = proto.pairing_code(*args)
+        pairing["key"] = proto.session_key(*args)
+        self.pending_keys = [(host_pub, pairing["key"])] + self.pending_keys[:2]
+        log(f"Kopplungscode {pairing['code']}")
+        self.update_splash()
+
+    def on_paired(self, msg, _addr):
+        # Auch Bestätigungen einer gerade abgelaufenen Kopplung annehmen.
+        for host_pub, key in self.pending_keys:
+            if proto.verify(msg, key):
+                break
+        else:
+            return
+        self.config["host"] = {"pub": host_pub, "name": str(msg["name"])[:64],
+                               "key": proto.b64(key)}
+        proto.save_json(CONFIG_FILE, self.config)
+        log(f"Gekoppelt mit {self.config['host']['name']}")
+        self.pairing = None
+        self.pending_keys = []
+        self.repair = False
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+        self.start_pipeline()
+        self.update_splash()
+
+    def on_rejected(self, _msg, _addr):
+        if not self.pairing:
+            return
+        log("Kopplung abgelehnt")
+        self.pairing = None
+        self.rejected_until = time.monotonic() + REJECT_PAUSE
+        self.update_splash()
+
+    def on_unknown(self, _msg, _addr):
+        # Der Host kennt uns nicht (mehr): neu koppeln. Der alte Schlüssel
+        # bleibt, bis die neue Kopplung bestätigt ist.
+        if self.paired and not self.repair:
+            log("Host kennt diesen Client nicht mehr - koppele neu")
+            self.repair = True
+            self.update_splash()
 
     def build_pipeline(self):
         dec = "vah264dec" if has_element("vah264dec") and not self.args.software else "avdec_h264"
-        desc = (f"udpsrc name=src port={STREAM_PORT} buffer-size=4194304 "
-                "caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ! "
+        caps = proto.srtp_caps(proto.unb64(self.config["host"]["key"]))
+        desc = (f"udpsrc name=src port={proto.STREAM_PORT} buffer-size=4194304 caps=\"{caps}\" ! "
+                "srtpdec name=srtp ! "
                 # Im LAN kommen Pakete in Reihenfolge an; der Jitterbuffer kostet
                 # dort nur Latenz und wird erst ab --latency > 0 eingebaut.
                 + (f"rtpjitterbuffer name=jb latency={self.args.latency} drop-on-latency=true ! "
@@ -216,6 +351,8 @@ class Client:
             Gst.PadProbeType.BUFFER, self.on_packet)
         pipeline.get_by_name("shown").get_static_pad("src").add_probe(
             Gst.PadProbeType.BUFFER, self.count, "frames")
+        # srtpdec holt den Schlüssel pro SSRC über dieses Signal, nicht aus den Caps.
+        pipeline.get_by_name("srtp").connect("request-key", lambda _dec, _ssrc: Gst.Caps.from_string(caps))
         pipeline.get_bus().add_signal_watch()
         pipeline.get_bus().connect("message::error", self.on_error)
         self.picture.set_paintable(pipeline.get_by_name("sink").get_property("paintable"))

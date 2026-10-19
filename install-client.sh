@@ -8,9 +8,11 @@ if [[ "${1:-}" == "--autologin" ]]; then AUTOLOGIN=1; shift; fi
 LINK_IFACE="${1:-thunderbolt0}"
 
 sudo pacman -S --needed --noconfirm cage python-gobject gst-plugins-base gst-plugins-good \
-    gst-plugins-bad gst-plugin-va gst-libav gtk4 gst-plugin-gtk4 python-cairo
+    gst-plugins-bad gst-plugin-va gst-libav gtk4 gst-plugin-gtk4 python-cairo \
+    python-cryptography
 
 sudo install -Dm755 opentop-client /usr/local/bin/opentop-client
+sudo install -Dm644 opentop_proto.py /usr/local/share/opentop/opentop_proto.py
 sudo install -Dm644 data/opentop-session.desktop /usr/share/wayland-sessions/opentop.desktop
 
 # Unsichtbares Cursor-Theme, damit der eigene Mauszeiger nicht im Bild steht.

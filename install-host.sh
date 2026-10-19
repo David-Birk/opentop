@@ -6,13 +6,16 @@ cd "$(dirname "$0")"
 LINK_IFACE="${1:-thunderbolt0}"
 
 sudo pacman -S --needed --noconfirm python-gobject python-dbus gst-plugins-base \
-    gst-plugins-good gst-plugins-bad gst-plugin-pipewire gst-plugin-va gst-plugins-ugly libnotify
+    gst-plugins-good gst-plugins-bad gst-plugin-pipewire gst-plugin-va gst-plugins-ugly libnotify \
+    python-cryptography kdialog
 
 install -Dm755 opentop-host "$HOME/.local/bin/opentop-host"
+install -Dm644 opentop_proto.py "$HOME/.local/share/opentop/opentop_proto.py"
 install -Dm644 data/opentop-host.service "$HOME/.config/systemd/user/opentop-host.service"
 install -Dm644 data/opentop.desktop "$HOME/.local/share/applications/opentop.desktop"
 systemctl --user daemon-reload
-systemctl --user enable --now opentop-host.service
+systemctl --user enable opentop-host.service
+systemctl --user restart opentop-host.service
 
 # Direkte Kabelverbindung: Link-Local-Adressen, kein DHCP nötig.
 if ! nmcli -t -f NAME con show | grep -qx "opentop-$LINK_IFACE"; then

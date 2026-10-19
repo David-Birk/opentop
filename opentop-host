@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""opentop-host: legt in KDE Plasma einen virtuellen Monitor an und streamt ihn
-per H.264/RTP an einen opentop-client im LAN.
+"""opentop-host: legt in KDE Plasma virtuelle Monitore an und streamt sie
+verschlüsselt per H.264/SRTP an gekoppelte opentop-clients im LAN.
 
-Der Client meldet sich per UDP-Broadcast. Sobald er auftaucht, wird der
-virtuelle Monitor erzeugt; verschwindet er, wird der Monitor wieder entfernt.
+Clients melden sich per UDP-Broadcast. Ein neuer Client wird erst nach
+Bestätigung eines 6-stelligen Codes gekoppelt. Für jeden gekoppelten Client,
+der sich meldet, entsteht ein eigener virtueller Monitor; verschwindet er,
+wird der Monitor wieder entfernt.
 """
 import argparse
 import ipaddress
@@ -17,6 +19,10 @@ import sys
 import threading
 import time
 
+sys.path[:0] = [os.path.dirname(os.path.realpath(__file__)),
+                os.path.expanduser("~/.local/share/opentop")]
+import opentop_proto as proto
+
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
 import gi
@@ -25,16 +31,16 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstVideo", "1.0")
 from gi.repository import GLib, Gst, GstVideo
 
-BEACON_PORT = 47800
-STREAM_PORT = 47801
 CLIENT_TIMEOUT = 6
+REJECT_COOLDOWN = 300
 PACING_BITRATE = 80_000_000
 PACING_BURST = 16 * 1024
 KEYFRAME_MIN_INTERVAL = 0.3
 VIRTUAL_WIDTH = 1920  # KDE legt virtuelle Monitore fest mit 1920x1080 an
 LINK_LOCAL = ipaddress.ip_network("169.254.0.0/16")
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "opentop")
-TOKEN_FILE = os.path.join(CONFIG_DIR, "restore_token")
+TOKEN_FILE = os.path.join(proto.CONFIG_DIR, "restore_token")
+KEY_FILE = os.path.join(proto.CONFIG_DIR, "host.key")
+CLIENTS_FILE = os.path.join(proto.CONFIG_DIR, "clients.json")
 
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -135,7 +141,7 @@ class VirtualScreen:
 
     @staticmethod
     def _save_token(token):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+        os.makedirs(proto.CONFIG_DIR, exist_ok=True)
         with open(TOKEN_FILE, "w") as f:
             f.write(token)
 
@@ -154,6 +160,7 @@ class Pacer:
 
     def __init__(self, ip):
         self.ip = ip
+        self.port = proto.STREAM_PORT
         self.queue = queue.Queue()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
@@ -176,7 +183,7 @@ class Pacer:
                 tokens, last = len(data), time.perf_counter()
             tokens -= len(data)
             try:
-                self.sock.sendto(data, (self.ip, STREAM_PORT))
+                self.sock.sendto(data, (self.ip, self.port))
             except OSError:
                 pass
 
@@ -184,7 +191,7 @@ class Pacer:
         self.queue.put(None)
 
 
-def build_pipeline(fd, node_id, client_ip, size, args):
+def build_pipeline(fd, node_id, size, key, args):
     # path= nimmt die Node-ID (target-object erwartet die Serial). Ohne
     # dont-fallback weicht PipeWire sonst still auf die Webcam aus.
     src = (f"pipewiresrc name=src fd={fd} path={node_id} "
@@ -203,22 +210,29 @@ def build_pipeline(fd, node_id, client_ip, size, args):
                f"x264enc tune=zerolatency speed-preset=ultrafast bitrate={args.bitrate} "
                f"key-int-max={args.fps}")
     sink = (f"h264parse config-interval=-1 ! rtph264pay config-interval=-1 pt=96 mtu=1400 ! "
+            f"srtpenc name=srtp {proto.SRTPENC_PARAMS} ! "
             "appsink name=out emit-signals=true sync=false async=false")
     desc = f"{src} ! {enc} ! {sink}"
     log("Pipeline:", desc)
-    return Gst.parse_launch(desc)
+    pipeline = Gst.parse_launch(desc)
+    pipeline.get_by_name("srtp").set_property("key", Gst.Buffer.new_wrapped(proto.srtp_key(key)))
+    return pipeline
 
 
-def set_virtual_scale(client_width):
+def virtual_outputs():
+    try:
+        out = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True).stdout
+        return {o["id"] for o in json.loads(out)["outputs"] if o["name"].startswith("Virtual")}
+    except (OSError, ValueError, KeyError):
+        return set()
+
+
+def set_scale(output_id, client_width):
     # Logische Größe des virtuellen Monitors an das Client-Panel angleichen,
     # damit Schrift dort so groß ist wie auf einem nativen Display.
-    out = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True).stdout
-    match = re.search(r"Output: \S+ (Virtual-\S+)", re.sub(r"\x1b\[[0-9;]*m", "", out))
-    if not match:
-        return
     scale = max(1.0, round(VIRTUAL_WIDTH / client_width * 20) / 20)
-    log(f"Skalierung von {match[1]} auf {scale:g}")
-    subprocess.Popen(["kscreen-doctor", f"output.{match[1]}.scale.{scale:g}"],
+    log(f"Skalierung von Ausgabe {output_id} auf {scale:g}")
+    subprocess.Popen(["kscreen-doctor", f"output.{output_id}.scale.{scale:g}"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -227,87 +241,71 @@ def is_direct_link(ip):
     return ipaddress.ip_address(ip) in LINK_LOCAL
 
 
-class Host:
-    def __init__(self, args):
-        self.args = args
-        self.bus = dbus.SessionBus()
+class Session:
+    """Virtueller Monitor und Stream für genau einen gekoppelten Client."""
+
+    def __init__(self, host, client_id, info):
+        self.host = host
+        self.id = client_id
+        self.name = info["name"]
+        self.key = proto.unb64(info["key"])
         self.screen = None
         self.pipeline = None
         self.pacer = None
-        self.client_ip = None
-        self.client_size = None
+        self.ip = None
+        self.size = None
         self.peers = {}
+        self.outputs_before = set()
         self.retry_at = 0.0
-        self.last_keyframe = 0.0
-        self.frames = 0
         self.backoff = 0
+        self.last_keyframe = 0.0
+        self.last_seq = 0
+        self.frames = 0
 
-    def run(self):
-        if self.args.client:
-            self.start(self.args.client)
-        else:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", BEACON_PORT))
-            GLib.io_add_watch(sock.fileno(), GLib.IO_IN, self.on_beacon, sock)
-            GLib.timeout_add_seconds(1, self.check_timeout)
-            log(f"Warte auf opentop-client (UDP {BEACON_PORT}) ...")
-        GLib.MainLoop().run()
-
-    def on_beacon(self, _fd, _cond, sock):
-        data, (ip, _port) = sock.recvfrom(1024)
-        try:
-            msg = json.loads(data)
-        except ValueError:
-            return True
-        if msg.get("opentop") != 1:
-            return True
-        if self.args.allow and ip not in self.args.allow and msg.get("name") not in self.args.allow:
-            return True
+    def on_beacon(self, msg, ip):
         if ip not in self.peers:
-            log(f"Client {msg.get('name', ip)} erreichbar über {ip}")
+            log(f"{self.name} erreichbar über {ip}")
         self.peers[ip] = time.monotonic()
-        if msg.get("keyframe") and ip == self.client_ip:
+        if msg.get("keyframe") and ip == self.ip:
             self.request_keyframe()
         size = tuple(msg["size"]) if msg.get("size") else None
-        if size != self.client_size:
-            self.client_size = size
+        if size != self.size:
+            self.size = size
             if self.pipeline:
-                log(f"Client-Auflösung jetzt {size}, starte Stream neu")
+                log(f"{self.name}: Auflösung jetzt {size}, starte Stream neu")
                 self.stop(quiet=True)
         self.update_target()
-        return True
 
     def check_timeout(self):
         now = time.monotonic()
         for ip, seen in list(self.peers.items()):
             if now - seen > CLIENT_TIMEOUT:
-                log(f"{ip} nicht mehr erreichbar")
+                log(f"{self.name}: {ip} nicht mehr erreichbar")
                 del self.peers[ip]
         self.update_target()
-        return True
 
     def update_target(self):
         # Kabel vor WLAN; bei Gleichstand beim aktuellen Weg bleiben.
-        best = max(self.peers, key=lambda ip: (is_direct_link(ip), ip == self.client_ip),
-                   default=None)
+        best = max(self.peers, key=lambda ip: (is_direct_link(ip), ip == self.ip), default=None)
         if best is None:
-            if self.client_ip:
-                log("Client weg, beende virtuellen Monitor")
+            if self.ip:
+                log(f"{self.name} weg, entferne virtuellen Monitor")
                 self.stop()
-        elif self.client_ip is None:
-            if time.monotonic() >= self.retry_at:
+        elif self.ip is None:
+            # Nur eine Session gleichzeitig starten, damit der neue virtuelle
+            # Monitor eindeutig dieser Session zugeordnet werden kann.
+            if time.monotonic() >= self.retry_at and self.host.starting is None:
                 self.start(best)
-        elif best != self.client_ip:
+        elif best != self.ip:
             self.retarget(best)
 
     def retarget(self, ip):
-        log(f"Wechsle Verbindung {self.client_ip} -> {ip}")
-        self.client_ip = ip
+        log(f"{self.name}: wechsle Verbindung {self.ip} -> {ip}")
+        self.ip = ip
         if self.pipeline:
             self.pacer.ip = ip
             self.request_keyframe()
-            notify(self.bus, "Zweiter Monitor", "über Kabel" if is_direct_link(ip) else "über Netzwerk")
+            notify(self.host.bus, self.name, "über Kabel" if is_direct_link(ip) else "über Netzwerk")
 
     def request_keyframe(self):
         # Der Client meldet Paketverlust oder fehlendes Bild; ohne neuen
@@ -326,22 +324,26 @@ class Host:
     def log_stats(self, pipeline):
         if pipeline is not self.pipeline:
             return False
-        log(f"Statistik 5s: {self.frames} Bilder von KWin")
+        log(f"{self.name}: Statistik 5s: {self.frames} Bilder von KWin")
         self.frames = 0
         return True
 
     def start(self, ip):
-        self.client_ip = ip
-        self.screen = VirtualScreen(self.bus)
+        self.ip = ip
+        self.host.starting = self
+        self.outputs_before = virtual_outputs()
+        self.screen = VirtualScreen(self.host.bus)
         self.screen.open(self.on_ready, self.on_error)
 
     def on_ready(self, fd, node_id):
-        ip = self.client_ip
-        self.pipeline = build_pipeline(fd, node_id, ip, self.client_size, self.args)
-        self.pacer = Pacer(ip)
+        self.host.starting = None
+        args = self.host.args
+        self.pipeline = build_pipeline(fd, node_id, self.size, self.key, args)
+        self.pacer = Pacer(self.ip)
         self.pipeline.get_by_name("out").connect("new-sample", self.pacer.on_sample)
-        if self.client_size and not self.args.no_autoscale:
-            set_virtual_scale(self.client_size[0])
+        if self.size and not args.no_autoscale:
+            for output_id in virtual_outputs() - self.outputs_before:
+                set_scale(output_id, self.size[0])
         src_pad = self.pipeline.get_by_name("src").get_static_pad("src")
         src_pad.add_probe(Gst.PadProbeType.BUFFER, self.count_frame)
         src_pad.connect("notify::caps", lambda pad, _: pad.get_current_caps() and
@@ -350,53 +352,251 @@ class Host:
         self.pipeline.get_bus().add_signal_watch()
         self.pipeline.get_bus().connect("message::error", self.on_pipeline_error)
         self.pipeline.set_state(Gst.State.PLAYING)
-        log(f"Streame virtuellen Monitor an {ip}:{STREAM_PORT}")
+        log(f"Streame virtuellen Monitor an {self.name} ({self.ip}:{proto.STREAM_PORT})")
         GLib.timeout_add_seconds(3, self.on_stable, self.pipeline)
 
     def on_stable(self, pipeline):
         # Erst melden, wenn der Stream ein paar Sekunden ohne Fehler läuft.
         if pipeline is self.pipeline:
             self.backoff = 0
-            notify(self.bus, "Zweiter Monitor verbunden",
-                   "über Kabel" if is_direct_link(self.client_ip) else f"über Netzwerk ({self.client_ip})")
+            notify(self.host.bus, f"{self.name} verbunden",
+                   "über Kabel" if is_direct_link(self.ip) else f"über Netzwerk ({self.ip})")
         return False
 
     def on_error(self, reason):
         self.backoff = min(self.backoff * 2 or 2, 60)
-        log(f"Fehler: {reason} - neuer Versuch in {self.backoff}s")
+        log(f"{self.name}: Fehler: {reason} - neuer Versuch in {self.backoff}s")
         self.stop(quiet=True)
         self.retry_at = time.monotonic() + self.backoff
-        if self.args.client:
-            GLib.timeout_add_seconds(self.backoff, lambda: self.start(self.args.client) and False)
 
     def on_pipeline_error(self, _bus, msg):
         err, dbg = msg.parse_error()
         self.on_error(f"{err.message} ({dbg})")
 
     def stop(self, quiet=False):
+        if self.host.starting is self:
+            self.host.starting = None
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
             self.pacer.close()
             if not quiet:
-                notify(self.bus, "Zweiter Monitor getrennt")
+                notify(self.host.bus, f"{self.name} getrennt")
         if self.screen:
             self.screen.close()
             self.screen = None
-        self.client_ip = None
+        self.ip = None
+
+
+class Pairing:
+    """Laufende Kopplung mit einem noch unbekannten Client."""
+
+    def __init__(self, msg, addr):
+        self.id = msg["id"]
+        self.name = str(msg.get("name", "?"))[:64]
+        self.client_pub = msg["pub"]
+        self.addr = addr
+        self.host_nonce = proto.new_nonce()
+        self.client_nonce = None
+        self.code = None
+        self.dialog = None
+        self.result = None
+        self.created = time.monotonic()
+
+
+class Host:
+    def __init__(self, args):
+        self.args = args
+        self.bus = dbus.SessionBus()
+        self.identity = proto.Identity(KEY_FILE)
+        self.name = socket.gethostname()
+        self.clients = {}
+        self.clients_mtime = None
+        self.sessions = {}
+        self.pairings = {}
+        self.rejected = {}
+        self.starting = None
+        self.sock = None
+
+    def run(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", proto.BEACON_PORT))
+        GLib.io_add_watch(self.sock.fileno(), GLib.IO_IN, self.on_message)
+        GLib.timeout_add_seconds(1, self.check_timeout)
+        log(f"Warte auf opentop-clients (UDP {proto.BEACON_PORT}) ...")
+        GLib.MainLoop().run()
+
+    def load_clients(self):
+        # Neu einlesen, falls "opentop-host --forget" die Datei geändert hat.
+        try:
+            mtime = os.stat(CLIENTS_FILE).st_mtime
+        except OSError:
+            mtime = None
+        if mtime != self.clients_mtime:
+            self.clients_mtime = mtime
+            self.clients = proto.load_json(CLIENTS_FILE, {})
+            for client_id in list(self.sessions):
+                if client_id not in self.clients:
+                    self.sessions.pop(client_id).stop()
+        return self.clients
+
+    def send(self, msg, addr):
+        try:
+            self.sock.sendto(proto.encode(msg), addr)
+        except OSError as e:
+            log(f"Senden an {addr[0]} fehlgeschlagen:", e)
+
+    def on_message(self, _fd, _cond):
+        data, addr = self.sock.recvfrom(2048)
+        msg = proto.decode(data)
+        if not msg or not isinstance(msg.get("id"), str):
+            return True
+        handler = {"beacon": self.on_beacon, "hello": self.on_hello,
+                   "nonce": self.on_nonce}.get(msg.get("type"))
+        if handler:
+            try:
+                handler(msg, addr)
+            except (KeyError, TypeError, ValueError) as e:
+                log(f"Ungültige Nachricht von {addr[0]}:", e)
+        return True
+
+    def on_beacon(self, msg, addr):
+        if msg.get("host") != self.identity.pub:
+            return  # gehört zu einem anderen Host
+        info = self.load_clients().get(msg["id"])
+        if info is None:
+            self.send({"type": "unknown"}, addr)
+            return
+        key = proto.unb64(info["key"])
+        if not proto.verify(msg, key):
+            return
+        session = self.sessions.get(msg["id"])
+        if session is None:
+            session = self.sessions[msg["id"]] = Session(self, msg["id"], info)
+        # Wiederholte (mitgeschnittene) Beacons verwerfen.
+        if msg["seq"] <= session.last_seq:
+            return
+        session.last_seq = msg["seq"]
+        session.on_beacon(msg, addr[0])
+
+    def on_hello(self, msg, addr):
+        info = self.load_clients().get(msg["id"])
+        if info and info["pub"] == msg["pub"]:
+            # Schon gekoppelt, der Client hat die Bestätigung aber verpasst.
+            self.send(proto.sign({"type": "paired", "name": self.name},
+                                 proto.unb64(info["key"])), addr)
+            return
+        if time.monotonic() < self.rejected.get(msg["id"], 0):
+            return
+        pairing = self.pairings.get(msg["id"])
+        if pairing is None or pairing.client_pub != msg["pub"]:
+            pairing = self.pairings[msg["id"]] = Pairing(msg, addr)
+            log(f"Kopplungsanfrage von {pairing.name} ({addr[0]})")
+        pairing.addr = addr
+        self.send({"type": "commit", "pub": self.identity.pub,
+                   "commit": proto.commitment(self.identity.pub, pairing.client_pub,
+                                              pairing.host_nonce)}, addr)
+
+    def on_nonce(self, msg, addr):
+        pairing = self.pairings.get(msg["id"])
+        if pairing is None:
+            return
+        pairing.addr = addr
+        if pairing.client_nonce is None:
+            pairing.client_nonce = msg["nonce"]
+            shared = self.identity.shared(pairing.client_pub)
+            pairing.code = proto.pairing_code(shared, self.identity.pub, pairing.client_pub,
+                                              pairing.client_nonce, pairing.host_nonce)
+            pairing.key = proto.session_key(shared, self.identity.pub, pairing.client_pub,
+                                            pairing.client_nonce, pairing.host_nonce)
+            self.ask_user(pairing)
+        elif msg["nonce"] != pairing.client_nonce:
+            return
+        self.send({"type": "reveal", "nonce": pairing.host_nonce}, addr)
+        if pairing.result == "paired":
+            self.send(proto.sign({"type": "paired", "name": self.name}, pairing.key), addr)
+        elif pairing.result == "rejected":
+            self.send({"type": "rejected"}, addr)
+
+    def ask_user(self, pairing):
+        text = (f"„{pairing.name}“ möchte sich als zweiter Monitor mit diesem Rechner koppeln.\n\n"
+                f"Wird auf dem Laptop dieser Code angezeigt?\n\n{pairing.code}")
+        try:
+            pid, *_ = GLib.spawn_async(
+                ["kdialog", "--title", "opentop – Kopplung", "--yes-label", "Koppeln",
+                 "--no-label", "Ablehnen", "--yesno", text],
+                flags=GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.DO_NOT_REAP_CHILD)
+        except GLib.Error as e:
+            log("Kopplungsdialog konnte nicht geöffnet werden:", e.message)
+            return
+        pairing.dialog = pid
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, self.on_answer, pairing)
+
+    def on_answer(self, _pid, status, pairing):
+        pairing.dialog = None
+        if self.pairings.get(pairing.id) is not pairing:
+            return  # inzwischen abgelaufen
+        if status == 0:
+            pairing.result = "paired"
+            clients = self.load_clients()
+            clients[pairing.id] = {"name": pairing.name, "pub": pairing.client_pub,
+                                   "key": proto.b64(pairing.key)}
+            proto.save_json(CLIENTS_FILE, clients)
+            log(f"{pairing.name} gekoppelt")
+            self.send(proto.sign({"type": "paired", "name": self.name}, pairing.key), pairing.addr)
+        else:
+            pairing.result = "rejected"
+            self.rejected[pairing.id] = time.monotonic() + REJECT_COOLDOWN
+            log(f"Kopplung mit {pairing.name} abgelehnt")
+            self.send({"type": "rejected"}, pairing.addr)
+
+    def check_timeout(self):
+        now = time.monotonic()
+        for client_id, pairing in list(self.pairings.items()):
+            if now - pairing.created > proto.PAIRING_TIMEOUT:
+                if pairing.dialog:
+                    os.kill(pairing.dialog, 15)
+                del self.pairings[client_id]
+        for session in list(self.sessions.values()):
+            session.check_timeout()
+        return True
+
+    def stop(self):
+        for session in self.sessions.values():
+            session.stop(quiet=True)
+
+
+def manage_clients(args):
+    clients = proto.load_json(CLIENTS_FILE, {})
+    if args.list:
+        for client_id, info in clients.items():
+            print(f"{info['name']}  ({client_id})")
+        if not clients:
+            print("Keine gekoppelten Clients.")
+        return
+    target = args.forget
+    gone = [cid for cid, info in clients.items()
+            if target in ("all", cid, info["name"])]
+    for cid in gone:
+        print(f"Entkoppelt: {clients.pop(cid)['name']}")
+    if not gone:
+        print(f"Kein gekoppelter Client „{target}“.")
+    proto.save_json(CLIENTS_FILE, clients)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--client", help="Client-IP fest vorgeben statt Auto-Erkennung (z.B. über Tailscale)")
     p.add_argument("--bitrate", type=int, default=10000, help="kbit/s (Standard: 10000)")
     p.add_argument("--fps", type=int, default=60)
     p.add_argument("--software", action="store_true", help="x264 statt VA-API verwenden")
-    p.add_argument("--allow", action="append",
-                   help="nur diesen Client (Hostname oder IP) akzeptieren, mehrfach möglich")
+    p.add_argument("--list", action="store_true", help="gekoppelte Clients anzeigen")
+    p.add_argument("--forget", metavar="NAME|ID|all", help="Kopplung mit einem Client aufheben")
     p.add_argument("--no-autoscale", action="store_true",
                    help="Skalierung des virtuellen Monitors nicht anpassen")
     args = p.parse_args()
+    if args.list or args.forget:
+        return manage_clients(args)
 
     DBusGMainLoop(set_as_default=True)
     Gst.init(None)

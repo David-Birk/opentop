@@ -2,12 +2,13 @@
 
 **Einen zweiten Linux-Laptop als zusätzlichen Monitor verwenden – wie Sidecar, nur für KDE Plasma.**
 
-> 🇬🇧 *opentop turns a spare Linux laptop into a second monitor for a KDE Plasma
-> (Wayland) machine. The host creates a real virtual output through the
-> xdg-desktop-portal, encodes it with VA-API H.264 and streams it over RTP/UDP.
-> The client boots straight into a kiosk session (`cage`) that shows the stream
-> fullscreen and announces itself on the LAN – no setup needed on the second
-> screen. Documentation below is in German.*
+> 🇬🇧 *opentop turns spare Linux laptops into extra monitors for a KDE Plasma
+> (Wayland) machine. The host creates a real virtual output per client through
+> the xdg-desktop-portal, encodes it with VA-API H.264 and streams it encrypted
+> (SRTP) over UDP. Clients pair once by comparing a 6-digit code, then boot
+> straight into a kiosk session (`cage` + GTK4) that shows the stream
+> fullscreen – no setup needed on the second screen. Documentation below is in
+> German.*
 
 ```
  ┌──────────────── Host (KDE Plasma) ─────────────────┐          ┌──────── Client (beliebiges Arch) ────────┐
@@ -24,6 +25,11 @@
 - **Echter zweiter Bildschirm:** Plasma legt einen virtuellen Monitor an. Fenster
   lassen sich wie gewohnt hinüberschieben, die Anordnung stellst du in den
   Systemeinstellungen → Anzeige ein.
+- **Mehrere Clients:** Jeder gekoppelte Laptop bekommt seinen eigenen
+  virtuellen Monitor mit eigenem Stream.
+- **Gesicherte Kopplung:** Beim ersten Kontakt zeigen Client und Host denselben
+  6-stelligen Code; erst nach Bestätigung am Host wird gestreamt. Danach sind
+  alle Nachrichten signiert und das Video ist verschlüsselt.
 - **Automatisch:** Der Client meldet sich per UDP-Broadcast. Sobald er da ist,
   erscheint der Monitor; ist er 6 s weg, verschwindet der Monitor wieder.
 - **Am Client nichts zu tun:** Eigene Login-Sitzung „opentop“, optional per
@@ -96,8 +102,27 @@ Beide Skripte öffnen bei aktivem `firewalld` bzw. `ufw` die nötigen Ports.
 
 ## Benutzung
 
-Einfach beide Rechner einschalten. Der Monitor erscheint nach ein paar
-Sekunden, Plasma zeigt die Meldung „Zweiter Monitor verbunden“.
+### Erstes Koppeln
+
+1. Client einschalten. Der Wartebildschirm zeigt „Nicht gekoppelt“.
+2. Sobald der Host ihn sieht, erscheint am Client ein **6-stelliger Code** und
+   am Host ein Dialog „opentop – Kopplung“ mit einem Code.
+3. Stimmen beide Codes überein: **Koppeln** klicken. Sonst *Ablehnen* – dann
+   versucht gerade jemand, sich dazwischenzuschalten.
+
+Die Kopplung bleibt gespeichert. Ab dann einfach beide Rechner einschalten: Der
+Monitor erscheint nach ein paar Sekunden, Plasma meldet „… verbunden“.
+
+Gekoppelte Clients verwalten:
+
+```sh
+opentop-host --list                 # gekoppelte Clients anzeigen
+opentop-host --forget arch-ideapad  # Kopplung aufheben (Name, ID oder "all")
+```
+
+Am Client hebt `rm ~/.config/opentop/client.json` die Kopplung auf.
+
+### Alltag
 
 - **Monitor anordnen:** Systemeinstellungen → Anzeige → Monitor „Virtual…“.
   Plasma merkt sich die Position.
@@ -127,15 +152,14 @@ zeigt ihn): `./install-host.sh enp0s13f0u1u4`.
 ## Optionen
 
 ```
-opentop-host   [--client IP] [--allow NAME|IP] [--bitrate KBIT] [--fps N]
-               [--software] [--no-autoscale]
+opentop-host   [--bitrate KBIT] [--fps N] [--software] [--no-autoscale]
+               [--list] [--forget NAME|ID|all]
 opentop-client [--host IP] [--latency MS] [--software]
 ```
 
 | Option | Bedeutung |
 |---|---|
-| `--client IP` / `--host IP` | feste Gegenstelle statt Broadcast, z. B. über Tailscale/VPN |
-| `--allow NAME\|IP` | Host akzeptiert nur diese Clients (siehe Sicherheit) |
+| `--host IP` (Client) | Host direkt anschreiben statt Broadcast, z. B. über Tailscale/VPN |
 | `--bitrate` | Ziel-Bitrate in kbit/s, Standard 10000 |
 | `--latency MS` | Jitterbuffer am Client, Standard 0 (aus). Für WLAN z. B. `30` |
 | `--no-autoscale` | Skalierung des virtuellen Monitors nicht anfassen |
@@ -147,17 +171,24 @@ für den Client in der `Exec=`-Zeile von
 
 ## Sicherheit
 
-**Der Stream ist unverschlüsselt und ohne Anmeldung.** Jedes Gerät im selben
-Netz, das einen opentop-Beacon schickt, bekommt den Inhalt des virtuellen
-Monitors gestreamt (nur diesen, nicht die anderen Bildschirme). Im eigenen
-Heimnetz ist das meist unkritisch. In geteilten Netzen (WG, Büro, Uni):
+- **Kopplung:** X25519-Schlüsselaustausch, abgesichert durch einen
+  6-stelligen Vergleichscode (Prinzip wie Bluetooth „Numeric Comparison“: der
+  Host legt sich per Hash auf seine Zufallszahl fest, bevor er die des Clients
+  kennt). Ein Angreifer in der Mitte erwischt denselben Code nur mit
+  Wahrscheinlichkeit 1 : 1 000 000 – und auch dann musst du noch am Host
+  bestätigen.
+- **Nachrichten:** Alle Beacons gekoppelter Clients sind per HMAC-SHA256
+  signiert und mit einer fortlaufenden Nummer gegen Wiederholung geschützt.
+  Fremde oder gefälschte Beacons ignoriert der Host.
+- **Video:** SRTP (AES-128, HMAC-SHA1-80) mit einem Schlüssel pro Client.
+- **Was sichtbar bleibt:** Der Client meldet sich per Broadcast mit Hostname,
+  Auflösung und Client-ID – andere Geräte im Netz sehen also, *dass* dort ein
+  opentop-Client läuft, aber nicht, was er anzeigt.
+- **Schlüssel:** `~/.config/opentop/` (`host.key`, `clients.json` bzw.
+  `client.key`, `client.json`), nur für den eigenen Benutzer lesbar.
 
-- `--allow <hostname>` am Host setzen, damit nur dein Client akzeptiert wird.
-  Der Hostname im Beacon lässt sich aber fälschen, eine IP ist etwas besser.
-- Am besten eine direkte Kabelverbindung oder ein VPN (Tailscale/WireGuard)
-  mit `--client`/`--host` verwenden.
-
-Ports: UDP **47800** (Beacons, am Host offen), UDP **47801** (Video, am Client offen).
+Ports: UDP **47800** (Anmeldung/Kopplung, am Host offen), UDP **47801** (Video,
+am Client offen).
 
 ## Fehlersuche
 
@@ -172,7 +203,8 @@ journalctl -t opentop-client -f        # Client: Pakete, verloren, angezeigt
 |---|---|
 | Pixelblöcke, rosa/grüne Farben, Abdrücke | Paketverlust → `verloren` in der Client-Statistik prüfen. Bitrate senken, Kabel statt WLAN, bei WLAN `--latency 30` |
 | Ruckelt, Client-CPU hoch | kein VA-API-Treiber am Client, siehe Installation |
-| Kein Monitor erscheint | Host-Log prüfen; Firewall (UDP 47800); `--client IP` probieren |
+| Kein Monitor erscheint | Host-Log prüfen; Firewall (UDP 47800); am Client `--host IP` probieren |
+| Kein Kopplungsdialog | `kdialog` installiert? Nach *Ablehnen* wartet der Host 5 min, der Client 1 min |
 | Schrift zu klein/groß | Skalierung in den Anzeige-Einstellungen anpassen und `--no-autoscale` setzen |
 | Weniger als 60 fps in der Statistik | normal: KWin liefert nur bei Bildänderungen neue Frames |
 
