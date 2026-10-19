@@ -1,155 +1,191 @@
 # opentop
 
-**Einen zweiten Linux-Laptop als zusätzlichen Monitor verwenden – wie Sidecar, nur für KDE Plasma.**
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)
+![Desktop: KDE Plasma 6](https://img.shields.io/badge/host-KDE%20Plasma%206%20(Wayland)-1d99f3.svg)
 
-> 🇬🇧 *opentop turns spare Linux laptops into extra monitors for a KDE Plasma
-> (Wayland) machine. The host creates a real virtual output per client through
-> the xdg-desktop-portal, encodes it with VA-API H.264 and streams it encrypted
-> (SRTP) over UDP. Clients pair once by comparing a 6-digit code, then boot
-> straight into a kiosk session (`cage` + GTK4) that shows the stream
-> fullscreen – no setup needed on the second screen. Documentation below is in
-> German.*
+opentop macht aus Linux-Laptops zusätzliche Monitore für einen Rechner mit
+KDE Plasma. Der Host legt für jeden verbundenen Laptop einen echten virtuellen
+Monitor an und überträgt dessen Inhalt hardwarebeschleunigt und verschlüsselt
+über das lokale Netzwerk. Auf dem Client-Laptop ist nach der Einrichtung keine
+Bedienung mehr nötig: Er startet direkt in eine Vollbildanzeige und verbindet
+sich selbstständig.
 
+*English summary: opentop turns spare Linux laptops into additional monitors for
+a KDE Plasma (Wayland) machine. The host creates one virtual output per client
+via xdg-desktop-portal, encodes it with VA-API H.264 and streams it over SRTP.
+Clients pair once by comparing a six-digit code and then boot straight into a
+fullscreen kiosk session. The documentation below is in German.*
+
+## Inhalt
+
+- [Funktionen](#funktionen)
+- [Funktionsweise](#funktionsweise)
+- [Voraussetzungen](#voraussetzungen)
+- [Installation](#installation)
+- [Erste Schritte](#erste-schritte)
+- [Konfiguration](#konfiguration)
+- [Direkte Kabelverbindung](#direkte-kabelverbindung)
+- [Sicherheit](#sicherheit)
+- [Fehlersuche](#fehlersuche)
+- [Einschränkungen](#einschränkungen)
+- [Projektstruktur](#projektstruktur)
+- [Lizenz](#lizenz)
+
+## Funktionen
+
+**Anzeige**
+
+- Echter virtueller Monitor in KDE Plasma, der sich in den Anzeige-Einstellungen
+  wie ein physischer Bildschirm anordnen lässt.
+- Ein eigener Monitor und Stream pro Client; mehrere Clients gleichzeitig.
+- Automatische Anpassung an die Auflösung des Clients: Der Stream wird auf die
+  Panel-Auflösung skaliert und die Skalierung des virtuellen Monitors so gewählt,
+  dass Schrift in nativer Größe erscheint.
+- Bis zu 60 Bilder pro Sekunde mit VA-API-Encoding und -Decoding.
+
+**Verbindung**
+
+- Automatische Erkennung im lokalen Netzwerk; der Monitor erscheint, sobald der
+  Client erreichbar ist, und wird entfernt, wenn er verschwindet.
+- Bevorzugung direkter Kabelverbindungen (IPv4-Link-Local) gegenüber dem LAN
+  bzw. WLAN, mit unterbrechungsfreiem Wechsel.
+- Gleichmäßiges Versenden der Pakete (Pacing), damit Switches vor langsameren
+  Anschlüssen nicht überlaufen.
+- Sofortige Anforderung eines neuen Keyframes bei Paketverlust.
+
+**Sicherheit**
+
+- Einmalige Kopplung über einen sechsstelligen Vergleichscode.
+- Signierte Steuernachrichten mit Schutz gegen Wiederholung.
+- Verschlüsselte Videoübertragung (SRTP) mit einem Schlüssel pro Client.
+
+**Client**
+
+- Eigene Login-Sitzung im Kiosk-Modus, optional mit automatischer Anmeldung.
+- Wartebildschirm mit Hostname und IP-Adressen, solange keine Verbindung besteht.
+- Ausgeblendeter Mauszeiger.
+- Rückkehr zur Anmeldung per <kbd>Strg</kbd>+<kbd>Alt</kbd>+<kbd>Rücktaste</kbd>,
+  um den Laptop wieder normal zu verwenden.
+
+## Funktionsweise
+
+```mermaid
+flowchart LR
+    subgraph Host["Host (KDE Plasma, Wayland)"]
+        KWin["KWin<br/>virtueller Monitor"] -->|PipeWire| Conv["Skalierung und<br/>Farbkonvertierung"]
+        Conv --> Enc["H.264-Encoder<br/>(VA-API)"]
+        Enc --> SRTP["SRTP-<br/>Verschlüsselung"]
+        SRTP --> Pacer["Pacer"]
+    end
+    subgraph Client["Client (Kiosk-Sitzung)"]
+        Dec["SRTP-Entschlüsselung<br/>H.264-Decoder (VA-API)"] --> View["GTK4-Vollbild"]
+    end
+    Pacer -->|"Video, UDP 47801"| Dec
+    Client -.->|"Anmeldung, Keyframe-Anforderung<br/>UDP 47800, signiert"| Host
 ```
- ┌──────────────── Host (KDE Plasma) ─────────────────┐          ┌──────── Client (beliebiges Arch) ────────┐
- │ KWin ─► virtueller Monitor (ScreenCast-Portal)      │          │ SDDM-Autologin ─► cage (Kiosk)           │
- │      ─► PipeWire ─► videoconvertscale ─► vah264enc  │  RTP/UDP │      ─► vah264dec ─► GTK4-Vollbild       │
- │      ─► Pacer (gleichmäßiges Senden) ───────────────┼─────────►│                                          │
- │                                     ◄───────────────┼──────────┤ Beacon: „bin da, 1366×768,              │
- │  legt Monitor an / entfernt ihn, sendet Keyframes   │  UDP     │          brauche Keyframe“               │
- └─────────────────────────────────────────────────────┘          └──────────────────────────────────────────┘
-```
 
-## Was es kann
-
-- **Echter zweiter Bildschirm:** Plasma legt einen virtuellen Monitor an. Fenster
-  lassen sich wie gewohnt hinüberschieben, die Anordnung stellst du in den
-  Systemeinstellungen → Anzeige ein.
-- **Mehrere Clients:** Jeder gekoppelte Laptop bekommt seinen eigenen
-  virtuellen Monitor mit eigenem Stream.
-- **Gesicherte Kopplung:** Beim ersten Kontakt zeigen Client und Host denselben
-  6-stelligen Code; erst nach Bestätigung am Host wird gestreamt. Danach sind
-  alle Nachrichten signiert und das Video ist verschlüsselt.
-- **Automatisch:** Der Client meldet sich per UDP-Broadcast. Sobald er da ist,
-  erscheint der Monitor; ist er 6 s weg, verschwindet der Monitor wieder.
-- **Am Client nichts zu tun:** Eigene Login-Sitzung „opentop“, optional per
-  Autologin. Der Laptop bootet direkt in die Vollbildanzeige, der eigene
-  Mauszeiger ist ausgeblendet.
-- **Wartebildschirm:** Solange kein Host verbunden ist, zeigt der Client
-  Hostname und IP-Adressen statt eines schwarzen Bildes.
-- **Zurück zum normalen Desktop:** <kbd>Strg</kbd>+<kbd>Alt</kbd>+<kbd>Rücktaste</kbd>
-  beendet die opentop-Sitzung; SDDM zeigt die Anmeldung, dort z. B. Plasma
-  oder LXQt wählen.
-- **Flüssig:** 60 fps, Hardware-Encoding und -Decoding über VA-API, kein
-  Jitterbuffer im LAN.
-- **Robust:** Pakete werden gleichmäßig verteilt gesendet (Pacing), damit
-  Switches vor 100-Mbit-Anschlüssen nicht überlaufen. Bei Paketverlust oder
-  fehlendem Bild fordert der Client sofort einen neuen Keyframe an.
-- **Passende Größe:** Der Client meldet seine Panel-Auflösung. Der Host
-  skaliert den Stream darauf und stellt die Skalierung des virtuellen Monitors
-  passend ein (z. B. 140 % für 1366×768), damit Schrift so groß ist wie nativ.
-- **Kabel vor WLAN:** Gibt es eine direkte Verbindung (IPv4-Link-Local,
-  `169.254.x.x`, z. B. Thunderbolt-Netzwerk oder LAN-Kabel direkt zwischen den
-  Laptops), wird sie automatisch bevorzugt; Umschalten ohne Unterbrechung.
+Der Client meldet sich jede Sekunde per UDP-Broadcast mit seiner ID und
+Bildschirmauflösung. Kennt der Host den Client, fordert er über das
+ScreenCast-Portal einen virtuellen Monitor an, kodiert dessen Inhalt und sendet
+ihn an die Adresse, von der die Anmeldung kam. Bleibt die Anmeldung sechs
+Sekunden aus, wird der Monitor wieder entfernt.
 
 ## Voraussetzungen
 
-| | Host | Client |
-|---|---|---|
-| System | Arch Linux, **KDE Plasma 6 unter Wayland** | Arch Linux, beliebige Oberfläche |
-| Grafik | VA-API-fähige GPU (sonst Software-Fallback x264) | VA-API-fähige GPU empfohlen (sonst Software-Decoding) |
-| Netz | gleiches LAN wie der Client | gleiches LAN wie der Host |
+|              | Host                                         | Client                                     |
+|--------------|----------------------------------------------|--------------------------------------------|
+| System       | Arch Linux mit KDE Plasma 6 unter Wayland    | Arch Linux, beliebige Desktop-Umgebung     |
+| Grafik       | GPU mit VA-API (sonst Software-Encoding)     | GPU mit VA-API empfohlen                   |
+| Netzwerk     | Gleiches Subnetz wie der Client              | Gleiches Subnetz wie der Host              |
 
-Getestet: Plasma 6.8 auf Intel Iris Xe (Host) → Intel HD 505 / Pentium N4200,
-1366×768 (Client), beide per LAN, Client mit 100-Mbit-Anschluss.
+Getestete Konfiguration: Plasma 6.8 auf Intel Iris Xe als Host, Intel HD 505
+(Pentium N4200, 1366 × 768) als Client, verbunden über ein kabelgebundenes LAN
+mit 100 Mbit/s auf Client-Seite.
 
 ## Installation
 
-Repository auf beide Rechner holen:
+Das Repository auf beiden Rechnern klonen:
 
 ```sh
 git clone https://github.com/David-Birk/opentop.git
 cd opentop
 ```
 
-**Host** (der Plasma-Rechner):
+### Host
 
 ```sh
 ./install-host.sh
 ```
 
-Installiert die GStreamer-Pakete, `opentop-host` nach `~/.local/bin`, einen
-systemd-User-Dienst, der mit Plasma startet, und den Starter **opentop** im
-Menü (schaltet den Dienst an/aus).
+Das Skript installiert die benötigten Pakete, `opentop-host` nach
+`~/.local/bin`, einen systemd-Benutzerdienst, der mit der Plasma-Sitzung startet,
+sowie einen Menüeintrag **opentop**, der den Dienst ein- und ausschaltet.
 
-**Client** (der Laptop, der Monitor sein soll):
+### Client
 
 ```sh
 ./install-client.sh --autologin
 ```
 
-Installiert `cage`, GTK4, GStreamer und `opentop-client`, die Sitzung
-„opentop (Zweiter Monitor)“ und ein unsichtbares Cursor-Theme für diese Sitzung.
-Mit `--autologin` richtet das Skript SDDM bzw. LightDM so ein, dass der Laptop
-direkt in diese Sitzung startet. Ohne die Option wählst du sie im Login-Bildschirm.
+Das Skript installiert die benötigten Pakete, `opentop-client` nach
+`/usr/local/bin`, die Login-Sitzung „opentop (Zweiter Monitor)“ und ein
+unsichtbares Cursor-Theme für diese Sitzung. Mit `--autologin` wird SDDM bzw.
+LightDM so konfiguriert, dass der Laptop direkt in diese Sitzung startet. Ohne
+die Option lässt sich die Sitzung im Anmeldebildschirm auswählen.
 
-> **VA-API-Treiber:** Das Skript installiert ihn nicht automatisch, weil er von
-> der GPU abhängt. Intel ab Broadwell: `intel-media-driver`, ältere Intel:
-> `libva-intel-driver`, AMD: in `mesa` enthalten. Ohne Treiber dekodiert der
-> Client in Software – auf schwachen CPUs ruckelt das deutlich.
+Der VA-API-Treiber wird nicht automatisch installiert, da er von der GPU
+abhängt:
 
-Beide Skripte öffnen bei aktivem `firewalld` bzw. `ufw` die nötigen Ports.
+| GPU                         | Paket                |
+|-----------------------------|----------------------|
+| Intel ab Broadwell          | `intel-media-driver` |
+| Intel vor Broadwell         | `libva-intel-driver` |
+| AMD                         | in `mesa` enthalten  |
 
-## Benutzung
+Ohne Treiber dekodiert der Client in Software, was auf schwachen Prozessoren zu
+deutlichem Ruckeln führt.
 
-### Erstes Koppeln
+Beide Skripte öffnen bei aktivem `firewalld` oder `ufw` die benötigten Ports.
 
-1. Client einschalten. Der Wartebildschirm zeigt „Nicht gekoppelt“.
-2. Sobald der Host ihn sieht, erscheint am Client ein **6-stelliger Code** und
-   am Host ein Dialog „opentop – Kopplung“ mit einem Code.
-3. Stimmen beide Codes überein: **Koppeln** klicken. Sonst *Ablehnen* – dann
-   versucht gerade jemand, sich dazwischenzuschalten.
+## Erste Schritte
 
-Die Kopplung bleibt gespeichert. Ab dann einfach beide Rechner einschalten: Der
-Monitor erscheint nach ein paar Sekunden, Plasma meldet „… verbunden“.
+### Kopplung
 
-Gekoppelte Clients verwalten:
+Ein Client muss einmalig mit dem Host gekoppelt werden:
+
+1. Den Client starten. Der Wartebildschirm zeigt „Nicht gekoppelt“.
+2. Sobald der Host den Client erkennt, zeigt der Client einen sechsstelligen
+   Code an, und auf dem Host öffnet sich der Dialog „opentop – Kopplung“.
+3. Stimmen die Codes überein, mit **Koppeln** bestätigen. Weichen sie ab, mit
+   **Ablehnen** abbrechen.
+
+Die Kopplung wird auf beiden Seiten gespeichert. Danach verbindet sich der
+Client bei jedem Start automatisch.
+
+### Betrieb
+
+- **Monitor anordnen:** Systemeinstellungen → Anzeige → Ausgabe „Virtual…“.
+  Plasma speichert die Position.
+- **Host ein- und ausschalten:** Menüeintrag **opentop** oder
+  `systemctl --user start|stop opentop-host`.
+- **Client normal verwenden:** <kbd>Strg</kbd>+<kbd>Alt</kbd>+<kbd>Rücktaste</kbd>
+  beendet die opentop-Sitzung. Im Anmeldebildschirm kann anschließend eine
+  andere Sitzung gewählt werden. Nach einem Neustart startet per Autologin
+  wieder opentop.
+- **Autologin deaktivieren:** `/etc/sddm.conf.d/50-opentop.conf` entfernen.
+
+### Kopplungen verwalten
 
 ```sh
-opentop-host --list                 # gekoppelte Clients anzeigen
-opentop-host --forget arch-ideapad  # Kopplung aufheben (Name, ID oder "all")
+opentop-host --list                   # gekoppelte Clients anzeigen
+opentop-host --forget <name|id|all>   # Kopplung aufheben
 ```
 
-Am Client hebt `rm ~/.config/opentop/client.json` die Kopplung auf.
+Auf dem Client wird die Kopplung durch Löschen von
+`~/.config/opentop/client.json` aufgehoben.
 
-### Alltag
-
-- **Monitor anordnen:** Systemeinstellungen → Anzeige → Monitor „Virtual…“.
-  Plasma merkt sich die Position.
-- **Host aus/an:** Starter „opentop“ im Menü oder
-  `systemctl --user stop|start opentop-host`.
-- **Am Client zurück zum normalen Desktop:** <kbd>Strg</kbd>+<kbd>Alt</kbd>+<kbd>Rücktaste</kbd>.
-  Die Sitzung endet, SDDM zeigt die Anmeldung, dort eine andere Sitzung wählen.
-  Nach dem nächsten Neustart startet per Autologin wieder opentop. Autologin
-  ganz abschalten: `/etc/sddm.conf.d/50-opentop.conf` löschen.
-
-### Direkte Kabelverbindung
-
-opentop läuft über IP. Jede Verbindung, die Linux als Netzwerkkarte erkennt,
-funktioniert:
-
-- **Thunderbolt/USB4 auf beiden Seiten:** passendes USB-C-Kabel, Interface
-  `thunderbolt0`.
-- **LAN-Kabel direkt** zwischen den Laptops oder zwei USB-LAN-Adapter.
-
-Die Installationsskripte legen für `thunderbolt0` ein NetworkManager-Profil mit
-Link-Local-Adressen an. Für andere Interfaces den Namen übergeben (`ip link`
-zeigt ihn): `./install-host.sh enp0s13f0u1u4`.
-
-> Ein normales USB-Kabel zwischen zwei Laptops funktioniert **nicht** – beide
-> Seiten sind USB-Hosts.
-
-## Optionen
+## Konfiguration
 
 ```
 opentop-host   [--bitrate KBIT] [--fps N] [--software] [--no-autoscale]
@@ -157,66 +193,103 @@ opentop-host   [--bitrate KBIT] [--fps N] [--software] [--no-autoscale]
 opentop-client [--host IP] [--latency MS] [--software]
 ```
 
-| Option | Bedeutung |
-|---|---|
-| `--host IP` (Client) | Host direkt anschreiben statt Broadcast, z. B. über Tailscale/VPN |
-| `--bitrate` | Ziel-Bitrate in kbit/s, Standard 10000 |
-| `--latency MS` | Jitterbuffer am Client, Standard 0 (aus). Für WLAN z. B. `30` |
-| `--no-autoscale` | Skalierung des virtuellen Monitors nicht anfassen |
-| `--software` | x264 bzw. avdec statt VA-API |
+| Option           | Programm | Beschreibung                                                          | Standard |
+|------------------|----------|-----------------------------------------------------------------------|----------|
+| `--bitrate`      | Host     | Ziel-Bitrate in kbit/s                                                | 10000    |
+| `--fps`          | Host     | Maximale Bildrate                                                     | 60       |
+| `--no-autoscale` | Host     | Skalierung des virtuellen Monitors nicht automatisch setzen           | aus      |
+| `--software`     | beide    | Software-Encoder bzw. -Decoder statt VA-API verwenden                 | aus      |
+| `--host`         | Client   | Host direkt adressieren statt per Broadcast, etwa über ein VPN        | –        |
+| `--latency`      | Client   | Jitterbuffer in Millisekunden; für WLAN-Verbindungen etwa `30`        | 0        |
 
-Optionen für den Host trägst du per `systemctl --user edit opentop-host` ein,
-für den Client in der `Exec=`-Zeile von
+Host-Optionen werden über `systemctl --user edit opentop-host` gesetzt,
+Client-Optionen in der `Exec=`-Zeile von
 `/usr/share/wayland-sessions/opentop.desktop`.
+
+## Direkte Kabelverbindung
+
+opentop arbeitet auf IP-Ebene. Jede Verbindung, die Linux als Netzwerkschnittstelle
+bereitstellt, ist geeignet:
+
+- **Thunderbolt oder USB4** auf beiden Seiten mit passendem USB-C-Kabel
+  (Schnittstelle `thunderbolt0`).
+- **Ethernet-Kabel** direkt zwischen beiden Rechnern, gegebenenfalls über
+  USB-Ethernet-Adapter.
+
+Die Installationsskripte legen für `thunderbolt0` ein NetworkManager-Profil mit
+Link-Local-Adressierung an. Für eine andere Schnittstelle wird deren Name als
+Argument übergeben, zum Beispiel `./install-host.sh enp0s13f0u1u4`.
+
+Ein gewöhnliches USB-Kabel zwischen zwei Laptops ist nicht geeignet, da beide
+Geräte als USB-Host arbeiten.
 
 ## Sicherheit
 
-- **Kopplung:** X25519-Schlüsselaustausch, abgesichert durch einen
-  6-stelligen Vergleichscode (Prinzip wie Bluetooth „Numeric Comparison“: der
-  Host legt sich per Hash auf seine Zufallszahl fest, bevor er die des Clients
-  kennt). Ein Angreifer in der Mitte erwischt denselben Code nur mit
-  Wahrscheinlichkeit 1 : 1 000 000 – und auch dann musst du noch am Host
-  bestätigen.
-- **Nachrichten:** Alle Beacons gekoppelter Clients sind per HMAC-SHA256
-  signiert und mit einer fortlaufenden Nummer gegen Wiederholung geschützt.
-  Fremde oder gefälschte Beacons ignoriert der Host.
-- **Video:** SRTP (AES-128, HMAC-SHA1-80) mit einem Schlüssel pro Client.
-- **Was sichtbar bleibt:** Der Client meldet sich per Broadcast mit Hostname,
-  Auflösung und Client-ID – andere Geräte im Netz sehen also, *dass* dort ein
-  opentop-Client läuft, aber nicht, was er anzeigt.
-- **Schlüssel:** `~/.config/opentop/` (`host.key`, `clients.json` bzw.
-  `client.key`, `client.json`), nur für den eigenen Benutzer lesbar.
+**Kopplung.** Host und Client tauschen per X25519 einen Schlüssel aus. Der
+Austausch wird durch einen sechsstelligen Vergleichscode abgesichert, nach dem
+Prinzip von Bluetooth Numeric Comparison: Der Host legt sich über einen Hash auf
+seine Zufallszahl fest, bevor er die des Clients kennt. Ein Angreifer zwischen
+beiden Geräten erzeugt dadurch nur mit einer Wahrscheinlichkeit von 1 : 10⁶
+übereinstimmende Codes, und die Kopplung erfordert zusätzlich die Bestätigung am
+Host.
 
-Ports: UDP **47800** (Anmeldung/Kopplung, am Host offen), UDP **47801** (Video,
-am Client offen).
+**Steuernachrichten.** Anmeldungen gekoppelter Clients sind mit HMAC-SHA256
+signiert und enthalten eine fortlaufende Nummer. Gefälschte und wiederholt
+gesendete Nachrichten werden verworfen.
+
+**Video.** Die Übertragung erfolgt per SRTP (AES-128-ICM, HMAC-SHA1-80) mit
+einem eigenen Schlüssel pro Client.
+
+**Sichtbare Metadaten.** Die Anmeldung des Clients wird per Broadcast versendet
+und enthält Hostname, Bildschirmauflösung und Client-ID. Andere Geräte im
+Netzwerk können also erkennen, dass ein opentop-Client aktiv ist, nicht aber den
+übertragenen Inhalt.
+
+**Schlüsselablage.** `~/.config/opentop/` mit `host.key` und `clients.json` auf
+dem Host bzw. `client.key` und `client.json` auf dem Client. Die Dateien sind nur
+für den jeweiligen Benutzer lesbar.
+
+**Ports.** UDP 47800 für Anmeldung und Kopplung (eingehend auf dem Host),
+UDP 47801 für das Video (eingehend auf dem Client).
 
 ## Fehlersuche
 
-Beide Seiten schreiben alle 5 Sekunden eine Statistik ins Journal:
+Host und Client protokollieren alle fünf Sekunden eine Statistik:
 
 ```sh
-journalctl --user -u opentop-host -f   # Host: Bilder von KWin, Caps, Fehler
-journalctl -t opentop-client -f        # Client: Pakete, verloren, angezeigt
+journalctl --user -u opentop-host -f   # Host: Bildrate, Formate, Fehler
+journalctl -t opentop-client -f        # Client: Pakete, Verluste, angezeigte Bilder
 ```
 
-| Symptom | Ursache / Lösung |
-|---|---|
-| Pixelblöcke, rosa/grüne Farben, Abdrücke | Paketverlust → `verloren` in der Client-Statistik prüfen. Bitrate senken, Kabel statt WLAN, bei WLAN `--latency 30` |
-| Ruckelt, Client-CPU hoch | kein VA-API-Treiber am Client, siehe Installation |
-| Kein Monitor erscheint | Host-Log prüfen; Firewall (UDP 47800); am Client `--host IP` probieren |
-| Kein Kopplungsdialog | `kdialog` installiert? Nach *Ablehnen* wartet der Host 5 min, der Client 1 min |
-| Schrift zu klein/groß | Skalierung in den Anzeige-Einstellungen anpassen und `--no-autoscale` setzen |
-| Weniger als 60 fps in der Statistik | normal: KWin liefert nur bei Bildänderungen neue Frames |
+| Symptom                                     | Ursache und Abhilfe                                                                 |
+|---------------------------------------------|-------------------------------------------------------------------------------------|
+| Blockartefakte, falsche Farben, Bildreste   | Paketverlust. Bitrate senken, Kabel statt WLAN verwenden, bei WLAN `--latency 30`.  |
+| Ruckeln, hohe CPU-Last am Client            | Kein VA-API-Treiber installiert, siehe [Installation](#client).                      |
+| Kein Monitor erscheint                      | Host-Protokoll prüfen, Firewall für UDP 47800 prüfen, am Client `--host` setzen.     |
+| Kein Kopplungsdialog                        | `kdialog` fehlt, oder eine Ablehnung ist noch aktiv (Host 5 min, Client 1 min).      |
+| Schrift zu groß oder zu klein               | Skalierung in den Anzeige-Einstellungen anpassen und `--no-autoscale` setzen.       |
+| Statistik zeigt weniger als 60 Bilder/s     | Erwartetes Verhalten: KWin liefert nur bei Bildänderungen neue Frames.              |
 
-## Grenzen
+## Einschränkungen
 
-- Nur KDE Plasma als Host. Andere Compositors bieten über das Portal
-  (noch) keine virtuellen Monitore an.
-- KDE legt virtuelle Monitore fest mit 1920×1080 an. Andere Seitenverhältnisse
-  als 16:9 bekommen schwarze Ränder.
-- Tastatur und Touchpad des Clients steuern nichts, er zeigt nur an.
-- Kein Ton.
+- Als Host wird nur KDE Plasma unterstützt, da andere Compositors über das
+  ScreenCast-Portal derzeit keine virtuellen Monitore bereitstellen.
+- KDE erzeugt virtuelle Monitore mit fester Auflösung von 1920 × 1080. Bei
+  Clients mit anderem Seitenverhältnis entstehen Ränder.
+- Eingaben am Client werden nicht an den Host weitergeleitet.
+- Es wird kein Ton übertragen.
+
+## Projektstruktur
+
+| Datei                      | Zweck                                                        |
+|----------------------------|--------------------------------------------------------------|
+| `opentop-host`             | Host-Dienst: Kopplung, virtuelle Monitore, Encoding, Versand |
+| `opentop-client`           | Client: Kopplung, Empfang, Decoding, Vollbildanzeige         |
+| `opentop_proto.py`         | Gemeinsames Protokoll und Kryptografie                       |
+| `install-host.sh`          | Installation auf dem Host                                    |
+| `install-client.sh`        | Installation auf dem Client                                  |
+| `data/`                    | systemd-Dienst, Menüeintrag und Login-Sitzung                |
 
 ## Lizenz
 
-MIT, siehe [LICENSE](LICENSE).
+Veröffentlicht unter der MIT-Lizenz, siehe [LICENSE](LICENSE).
