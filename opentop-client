@@ -3,6 +3,8 @@
 
 Meldet sich jede Sekunde per UDP-Broadcast, damit der Host den Monitor
 automatisch anlegt. Gedacht für den Start in einer cage-Sitzung (Kiosk).
+Ohne Verbindung zeigt er einen Wartebildschirm; Strg+Alt+Rücktaste beendet
+ihn und damit die Sitzung, sodass SDDM wieder die Anmeldung anzeigt.
 """
 import argparse
 import glob
@@ -15,13 +17,25 @@ import time
 
 import gi
 
+gi.require_version("Gdk", "4.0")
 gi.require_version("Gst", "1.0")
 gi.require_version("GstRtp", "1.0")
-from gi.repository import GLib, Gst, GstRtp
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gdk, GLib, Gst, GstRtp, Gtk
 
 BEACON_PORT = 47800
 STREAM_PORT = 47801
 STALL_TIMEOUT = 3
+QUIT_HINT = "Strg + Alt + Rücktaste  –  zurück zur Anmeldung"
+
+CSS = b"""
+window, .splash { background: #101318; color: #e6e9ef; }
+.title { font-size: 64px; font-weight: 800; letter-spacing: 2px; }
+.status { font-size: 22px; color: #9aa4b2; }
+.address { font-size: 18px; color: #6c7686; font-family: monospace; }
+.hint { font-size: 14px; color: #4f5866; }
+spinner { min-width: 32px; min-height: 32px; color: #5b8def; }
+"""
 
 
 def log(*args):
@@ -48,14 +62,18 @@ def screen_size():
     return None
 
 
-def broadcast_addresses():
+def ipv4_addresses():
     try:
         out = subprocess.run(["ip", "-j", "-4", "addr", "show", "up"],
                              capture_output=True, text=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
-        return ["255.255.255.255"]
-    addrs = {a["broadcast"] for iface in json.loads(out) if iface["ifname"] != "lo"
-             for a in iface.get("addr_info", []) if a.get("broadcast")}
+        return []
+    return [a for iface in json.loads(out) if iface["ifname"] != "lo"
+            for a in iface.get("addr_info", [])]
+
+
+def broadcast_addresses():
+    addrs = {a["broadcast"] for a in ipv4_addresses() if a.get("broadcast")}
     return sorted(addrs) or ["255.255.255.255"]
 
 
@@ -73,13 +91,77 @@ class Client:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
     def run(self):
+        self.app = Gtk.Application(application_id="io.github.davidbirk.opentop")
+        self.app.connect("activate", self.on_activate)
+        self.app.run([])
+
+    def on_activate(self, app):
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.window = Gtk.ApplicationWindow(application=app, title="opentop")
+        self.window.set_cursor(Gdk.Cursor.new_from_name("none"))
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        self.window.add_controller(keys)
+
+        self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.add_named(self.build_splash(), "splash")
+        self.stack.add_named(self.picture, "video")
+        self.window.set_child(self.stack)
+        self.window.fullscreen()
+        self.window.present()
+
         self.start_pipeline()
         self.send_beacon()
+        self.update_splash()
         GLib.timeout_add_seconds(1, self.send_beacon)
         GLib.timeout_add_seconds(1, self.check_stall)
         GLib.timeout_add_seconds(5, self.log_stats)
+        GLib.timeout_add_seconds(5, self.update_splash)
         GLib.timeout_add(500, self.check_picture)
-        GLib.MainLoop().run()
+
+    def build_splash(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                      valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+        box.add_css_class("splash")
+        title = Gtk.Label(label="opentop")
+        title.add_css_class("title")
+        row = Gtk.Box(spacing=14, halign=Gtk.Align.CENTER)
+        row.append(Gtk.Spinner(spinning=True))
+        self.status = Gtk.Label()
+        self.status.add_css_class("status")
+        row.append(self.status)
+        self.address = Gtk.Label(justify=Gtk.Justification.CENTER)
+        self.address.add_css_class("address")
+        hint = Gtk.Label(label=QUIT_HINT, margin_top=40)
+        hint.add_css_class("hint")
+        for widget in (title, row, self.address, hint):
+            box.append(widget)
+        outer = Gtk.Box()
+        outer.add_css_class("splash")
+        box.set_hexpand(True)
+        outer.append(box)
+        return outer
+
+    def update_splash(self):
+        receiving = time.monotonic() - self.last_buffer < 1
+        self.status.set_label("Verbinde …" if receiving else "Warte auf den Host …")
+        ips = [a["local"] for a in ipv4_addresses()]
+        self.address.set_label(f"{self.name}\n{'  ·  '.join(ips) or 'kein Netzwerk'}")
+        return True
+
+    def on_key(self, _ctrl, keyval, _keycode, state):
+        mods = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK
+        if keyval == Gdk.KEY_BackSpace and state & mods == mods:
+            log("Beendet per Tastenkombination")
+            self.pipeline.set_state(Gst.State.NULL)
+            self.app.quit()
+            return True
+        return False
 
     def send_beacon(self, keyframe=False):
         # Über jedes Interface melden, damit der Host ein direktes Kabel
@@ -101,7 +183,8 @@ class Client:
                 # dort nur Latenz und wird erst ab --latency > 0 eingebaut.
                 + (f"rtpjitterbuffer name=jb latency={self.args.latency} drop-on-latency=true ! "
                    if self.args.latency else "") +
-                f"rtph264depay name=depay ! h264parse ! {dec} ! identity name=shown ! {self.args.sink} sync=false")
+                f"rtph264depay name=depay ! h264parse ! {dec} ! identity name=shown ! "
+                "gtk4paintablesink name=sink sync=false")
         log("Pipeline:", desc)
         pipeline = Gst.parse_launch(desc)
         pipeline.get_by_name("depay").get_static_pad("src").add_probe(
@@ -112,6 +195,7 @@ class Client:
             Gst.PadProbeType.BUFFER, self.count, "frames")
         pipeline.get_bus().add_signal_watch()
         pipeline.get_bus().connect("message::error", self.on_error)
+        self.picture.set_paintable(pipeline.get_by_name("sink").get_property("paintable"))
         return pipeline
 
     def on_packet(self, _pad, info):
@@ -141,6 +225,12 @@ class Client:
         now = time.monotonic()
         if now - self.last_buffer < 1 and now - self.last_frame > 1:
             self.request_keyframe()
+        showing = now - self.last_frame < STALL_TIMEOUT
+        page = "video" if showing else "splash"
+        if self.stack.get_visible_child_name() != page:
+            self.stack.set_visible_child_name(page)
+            if not showing:
+                self.update_splash()
         return True
 
     def log_stats(self):
@@ -182,7 +272,6 @@ def main():
                    help="Host-IP direkt anschreiben statt Broadcast (mehrfach möglich, z.B. Tailscale)")
     p.add_argument("--latency", type=int, default=0,
                    help="Jitterbuffer in ms, z.B. 30 für WLAN (Standard: 0 = aus)")
-    p.add_argument("--sink", default="glimagesink", help="Video-Sink (Standard: glimagesink)")
     p.add_argument("--software", action="store_true", help="avdec_h264 statt VA-API verwenden")
     args = p.parse_args()
 

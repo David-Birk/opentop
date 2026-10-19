@@ -12,7 +12,7 @@
 ```
  ┌──────────────── Host (KDE Plasma) ─────────────────┐          ┌──────── Client (beliebiges Arch) ────────┐
  │ KWin ─► virtueller Monitor (ScreenCast-Portal)      │          │ SDDM-Autologin ─► cage (Kiosk)           │
- │      ─► PipeWire ─► videoconvertscale ─► vah264enc  │  RTP/UDP │      ─► vah264dec ─► Vollbild            │
+ │      ─► PipeWire ─► videoconvertscale ─► vah264enc  │  RTP/UDP │      ─► vah264dec ─► GTK4-Vollbild       │
  │      ─► Pacer (gleichmäßiges Senden) ───────────────┼─────────►│                                          │
  │                                     ◄───────────────┼──────────┤ Beacon: „bin da, 1366×768,              │
  │  legt Monitor an / entfernt ihn, sendet Keyframes   │  UDP     │          brauche Keyframe“               │
@@ -29,6 +29,11 @@
 - **Am Client nichts zu tun:** Eigene Login-Sitzung „opentop“, optional per
   Autologin. Der Laptop bootet direkt in die Vollbildanzeige, der eigene
   Mauszeiger ist ausgeblendet.
+- **Wartebildschirm:** Solange kein Host verbunden ist, zeigt der Client
+  Hostname und IP-Adressen statt eines schwarzen Bildes.
+- **Zurück zum normalen Desktop:** <kbd>Strg</kbd>+<kbd>Alt</kbd>+<kbd>Rücktaste</kbd>
+  beendet die opentop-Sitzung; SDDM zeigt die Anmeldung, dort z. B. Plasma
+  oder LXQt wählen.
 - **Flüssig:** 60 fps, Hardware-Encoding und -Decoding über VA-API, kein
   Jitterbuffer im LAN.
 - **Robust:** Pakete werden gleichmäßig verteilt gesendet (Pacing), damit
@@ -77,7 +82,7 @@ Menü (schaltet den Dienst an/aus).
 ./install-client.sh --autologin
 ```
 
-Installiert `cage`, GStreamer und `opentop-client`, die Sitzung
+Installiert `cage`, GTK4, GStreamer und `opentop-client`, die Sitzung
 „opentop (Zweiter Monitor)“ und ein unsichtbares Cursor-Theme für diese Sitzung.
 Mit `--autologin` richtet das Skript SDDM bzw. LightDM so ein, dass der Laptop
 direkt in diese Sitzung startet. Ohne die Option wählst du sie im Login-Bildschirm.
@@ -98,9 +103,10 @@ Sekunden, Plasma zeigt die Meldung „Zweiter Monitor verbunden“.
   Plasma merkt sich die Position.
 - **Host aus/an:** Starter „opentop“ im Menü oder
   `systemctl --user stop|start opentop-host`.
-- **Am Client zurück zum normalen Desktop:** Strg+Alt+F2 → anmelden →
-  `sudo systemctl restart sddm` und eine andere Sitzung wählen. Bei Autologin:
-  `/etc/sddm.conf.d/50-opentop.conf` löschen.
+- **Am Client zurück zum normalen Desktop:** <kbd>Strg</kbd>+<kbd>Alt</kbd>+<kbd>Rücktaste</kbd>.
+  Die Sitzung endet, SDDM zeigt die Anmeldung, dort eine andere Sitzung wählen.
+  Nach dem nächsten Neustart startet per Autologin wieder opentop. Autologin
+  ganz abschalten: `/etc/sddm.conf.d/50-opentop.conf` löschen.
 
 ### Direkte Kabelverbindung
 
@@ -123,7 +129,7 @@ zeigt ihn): `./install-host.sh enp0s13f0u1u4`.
 ```
 opentop-host   [--client IP] [--allow NAME|IP] [--bitrate KBIT] [--fps N]
                [--software] [--no-autoscale]
-opentop-client [--host IP] [--latency MS] [--sink ELEMENT] [--software]
+opentop-client [--host IP] [--latency MS] [--software]
 ```
 
 | Option | Bedeutung |
