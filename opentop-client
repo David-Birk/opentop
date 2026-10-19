@@ -9,12 +9,14 @@ ihn und damit die Sitzung, sodass SDDM wieder die Anmeldung anzeigt.
 import argparse
 import glob
 import json
+import math
 import os
 import socket
 import subprocess
 import sys
 import time
 
+import cairo  # noqa: F401  (für Cairo-Kontexte in Gtk.DrawingArea)
 import gi
 
 gi.require_version("Gdk", "4.0")
@@ -27,6 +29,7 @@ BEACON_PORT = 47800
 STREAM_PORT = 47801
 STALL_TIMEOUT = 3
 QUIT_HINT = "Strg + Alt + Rücktaste  –  zurück zur Anmeldung"
+CREDITS = "developed by David-Birk  ·  github.com/David-Birk"
 
 CSS = b"""
 window, .splash { background: #101318; color: #e6e9ef; }
@@ -34,7 +37,7 @@ window, .splash { background: #101318; color: #e6e9ef; }
 .status { font-size: 22px; color: #9aa4b2; }
 .address { font-size: 18px; color: #6c7686; font-family: monospace; }
 .hint { font-size: 14px; color: #4f5866; }
-spinner { min-width: 32px; min-height: 32px; color: #5b8def; }
+.credits { font-size: 14px; color: #5f6a7a; }
 """
 
 
@@ -131,7 +134,7 @@ class Client:
         title = Gtk.Label(label="opentop")
         title.add_css_class("title")
         row = Gtk.Box(spacing=14, halign=Gtk.Align.CENTER)
-        row.append(Gtk.Spinner(spinning=True))
+        row.append(self.build_spinner())
         self.status = Gtk.Label()
         self.status.add_css_class("status")
         row.append(self.status)
@@ -141,11 +144,31 @@ class Client:
         hint.add_css_class("hint")
         for widget in (title, row, self.address, hint):
             box.append(widget)
-        outer = Gtk.Box()
+        credits = Gtk.Label(label=CREDITS, valign=Gtk.Align.END, margin_bottom=28)
+        credits.add_css_class("credits")
+        outer = Gtk.Overlay(child=box)
         outer.add_css_class("splash")
-        box.set_hexpand(True)
-        outer.append(box)
+        outer.add_overlay(credits)
         return outer
+
+    def build_spinner(self):
+        # Eigener Ladekreis statt Gtk.Spinner: dessen Animation kommt aus dem
+        # GTK-Theme und steht bei manchen Themes (z.B. Breeze) still.
+        area = Gtk.DrawingArea(content_width=30, content_height=30, valign=Gtk.Align.CENTER)
+        area.set_draw_func(self.draw_spinner)
+        GLib.timeout_add(33, lambda: area.get_mapped() and area.queue_draw() or True)
+        return area
+
+    def draw_spinner(self, _area, cr, width, height):
+        radius = min(width, height) / 2 - 3
+        cr.set_line_width(3.5)
+        cr.set_source_rgb(0.16, 0.19, 0.25)
+        cr.arc(width / 2, height / 2, radius, 0, 2 * math.pi)
+        cr.stroke()
+        angle = time.monotonic() * 2 * math.pi * 0.9
+        cr.set_source_rgb(0.36, 0.55, 0.94)
+        cr.arc(width / 2, height / 2, radius, angle, angle + math.pi * 0.6)
+        cr.stroke()
 
     def update_splash(self):
         receiving = time.monotonic() - self.last_buffer < 1

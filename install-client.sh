@@ -8,7 +8,7 @@ if [[ "${1:-}" == "--autologin" ]]; then AUTOLOGIN=1; shift; fi
 LINK_IFACE="${1:-thunderbolt0}"
 
 sudo pacman -S --needed --noconfirm cage python-gobject gst-plugins-base gst-plugins-good \
-    gst-plugins-bad gst-plugin-va gst-libav gtk4 gst-plugin-gtk4
+    gst-plugins-bad gst-plugin-va gst-libav gtk4 gst-plugin-gtk4 python-cairo
 
 sudo install -Dm755 opentop-client /usr/local/bin/opentop-client
 sudo install -Dm644 data/opentop-session.desktop /usr/share/wayland-sessions/opentop.desktop
