@@ -363,8 +363,10 @@ class Client:
         if ok:
             seq = rtp.get_seq()
             rtp.unmap()
-            if self.last_seq is not None and seq != (self.last_seq + 1) & 0xFFFF:
-                self.stats["lost"] += (seq - self.last_seq - 1) & 0xFFFF
+            gap = (seq - self.last_seq - 1) & 0xFFFF if self.last_seq is not None else 0
+            # Große Sprünge sind ein neuer Stream (Host neu gestartet), kein Verlust.
+            if 0 < gap < 1000:
+                self.stats["lost"] += gap
                 GLib.idle_add(self.request_keyframe)
             self.last_seq = seq
         self.stats["packets"] += 1

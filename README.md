@@ -2,7 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)
-![Desktop: KDE Plasma 6](https://img.shields.io/badge/host-KDE%20Plasma%206%20(Wayland)-1d99f3.svg)
+![Host: KDE Plasma 6](https://img.shields.io/badge/host-KDE%20Plasma%206%20(Wayland)-1d99f3.svg)
+![Host: Windows experimentell](https://img.shields.io/badge/host-Windows%20(experimentell)-lightgrey.svg)
 
 opentop macht aus Linux-Laptops zusätzliche Monitore für einen Rechner mit
 KDE Plasma. Der Host legt für jeden verbundenen Laptop einen echten virtuellen
@@ -26,6 +27,7 @@ fullscreen kiosk session. The documentation below is in German.*
 - [Erste Schritte](#erste-schritte)
 - [Konfiguration](#konfiguration)
 - [Direkte Kabelverbindung](#direkte-kabelverbindung)
+- [Windows als Host (experimentell)](#windows-als-host-experimentell)
 - [Sicherheit](#sicherheit)
 - [Fehlersuche](#fehlersuche)
 - [Einschränkungen](#einschränkungen)
@@ -95,7 +97,7 @@ Sekunden aus, wird der Monitor wieder entfernt.
 
 |              | Host                                         | Client                                     |
 |--------------|----------------------------------------------|--------------------------------------------|
-| System       | Arch Linux mit KDE Plasma 6 unter Wayland    | Arch Linux, beliebige Desktop-Umgebung     |
+| System       | Arch Linux mit KDE Plasma 6 unter Wayland; Windows 10/11 experimentell | Arch Linux, beliebige Desktop-Umgebung |
 | Grafik       | GPU mit VA-API (sonst Software-Encoding)     | GPU mit VA-API empfohlen                   |
 | Netzwerk     | Gleiches Subnetz wie der Client              | Gleiches Subnetz wie der Host              |
 
@@ -223,6 +225,31 @@ Argument übergeben, zum Beispiel `./install-host.sh enp0s13f0u1u4`.
 Ein gewöhnliches USB-Kabel zwischen zwei Laptops ist nicht geeignet, da beide
 Geräte als USB-Host arbeiten.
 
+## Windows als Host (experimentell)
+
+Die Windows-Unterstützung befindet sich im Aufbau und wurde bisher nicht auf
+Windows getestet. Kern, Kopplung und Verschlüsselung sind identisch mit der
+Linux-Version; plattformspezifisch sind:
+
+| Aufgabe              | Umsetzung unter Windows                                                    |
+|----------------------|----------------------------------------------------------------------------|
+| Virtueller Monitor   | [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver), Auflösung exakt passend zum Client |
+| Bilderfassung        | `d3d11screencapturesrc`                                                    |
+| Encoder              | Intel Quick Sync, NVIDIA NVENC, AMD AMF oder Media Foundation, automatisch gewählt |
+| Kopplungsdialog      | Windows-Dialogfeld                                                         |
+| Autostart            | Aufgabenplanung bei der Anmeldung                                          |
+| Laufzeitumgebung     | MSYS2 (UCRT64) mit Python, PyGObject und GStreamer                         |
+
+Installation (in einer PowerShell, für die Firewall-Regel als Administrator):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-host-windows.ps1
+```
+
+Der Virtual Display Driver muss vorab von der
+[Release-Seite](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases)
+installiert werden. Offene Punkte sind im Code mit `TODO(VM)` markiert.
+
 ## Sicherheit
 
 **Kopplung.** Host und Client tauschen per X25519 einen Schlüssel aus. Der
@@ -272,10 +299,12 @@ journalctl -t opentop-client -f        # Client: Pakete, Verluste, angezeigte Bi
 
 ## Einschränkungen
 
-- Als Host wird nur KDE Plasma unterstützt, da andere Compositors über das
-  ScreenCast-Portal derzeit keine virtuellen Monitore bereitstellen.
+- Unter Linux wird als Host nur KDE Plasma unterstützt, da andere Compositors
+  über das ScreenCast-Portal derzeit keine virtuellen Monitore bereitstellen.
+  Die Windows-Unterstützung ist experimentell.
 - KDE erzeugt virtuelle Monitore mit fester Auflösung von 1920 × 1080. Bei
-  Clients mit anderem Seitenverhältnis entstehen Ränder.
+  Clients mit anderem Seitenverhältnis entstehen Ränder. Unter Windows besteht
+  diese Einschränkung nicht.
 - Eingaben am Client werden nicht an den Host weitergeleitet.
 - Es wird kein Ton übertragen.
 
@@ -283,10 +312,14 @@ journalctl -t opentop-client -f        # Client: Pakete, Verluste, angezeigte Bi
 
 | Datei                      | Zweck                                                        |
 |----------------------------|--------------------------------------------------------------|
-| `opentop-host`             | Host-Dienst: Kopplung, virtuelle Monitore, Encoding, Versand |
+| `opentop-host`             | Startprogramm des Hosts, wählt das Backend                   |
+| `opentop_host.py`          | Host-Kern: Kopplung, Sitzungen, Pipeline, Pacing             |
+| `opentop_kde.py`           | Host-Backend für KDE Plasma (Portal, PipeWire, VA-API)       |
+| `opentop_windows.py`       | Host-Backend für Windows (experimentell)                     |
 | `opentop-client`           | Client: Kopplung, Empfang, Decoding, Vollbildanzeige         |
 | `opentop_proto.py`         | Gemeinsames Protokoll und Kryptografie                       |
-| `install-host.sh`          | Installation auf dem Host                                    |
+| `install-host.sh`          | Installation auf dem Host (Linux)                            |
+| `install-host-windows.ps1` | Installation auf dem Host (Windows, experimentell)           |
 | `install-client.sh`        | Installation auf dem Client                                  |
 | `data/`                    | systemd-Dienst, Menüeintrag und Login-Sitzung                |
 

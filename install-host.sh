@@ -10,7 +10,9 @@ sudo pacman -S --needed --noconfirm python-gobject python-dbus gst-plugins-base 
     python-cryptography kdialog
 
 install -Dm755 opentop-host "$HOME/.local/bin/opentop-host"
-install -Dm644 opentop_proto.py "$HOME/.local/share/opentop/opentop_proto.py"
+for module in opentop_proto.py opentop_host.py opentop_kde.py; do
+    install -Dm644 "$module" "$HOME/.local/share/opentop/$module"
+done
 install -Dm644 data/opentop-host.service "$HOME/.config/systemd/user/opentop-host.service"
 install -Dm644 data/opentop.desktop "$HOME/.local/share/applications/opentop.desktop"
 systemctl --user daemon-reload

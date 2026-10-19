@@ -32,7 +32,10 @@ VERSION = 2
 BEACON_PORT = 47800
 STREAM_PORT = 47801
 PAIRING_TIMEOUT = 120
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "opentop")
+if os.name == "nt":
+    CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "opentop")
+else:
+    CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "opentop")
 
 # Gleiche Verfahren für Sender (srtpenc-Properties) und Empfänger (Caps).
 SRTPENC_PARAMS = ("rtp-cipher=aes-128-icm rtp-auth=hmac-sha1-80 "
@@ -78,6 +81,20 @@ def sign(msg, key):
 
 def verify(msg, key):
     return isinstance(msg.get("mac"), str) and hmac.compare_digest(msg["mac"], _mac(msg, key))
+
+
+def watch_socket(sock, callback):
+    """Ruft callback() auf, sobald auf sock Daten anliegen (im GLib-Mainloop).
+
+    Unter Windows sind Sockets keine Dateideskriptoren; GLib braucht dort
+    einen eigenen IOChannel-Typ.
+    """
+    from gi.repository import GLib
+    if os.name == "nt":
+        channel = GLib.IOChannel.win32_new_socket(sock.fileno())
+        GLib.io_add_watch(channel, GLib.PRIORITY_DEFAULT, GLib.IO_IN, lambda *_: callback())
+    else:
+        GLib.io_add_watch(sock.fileno(), GLib.IO_IN, lambda *_: callback())
 
 
 def load_json(path, default):
