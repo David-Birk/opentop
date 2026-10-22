@@ -152,6 +152,15 @@ class KdeBackend:
         # Auf die Panel-Auflösung des Clients skalieren: spart Bandbreite und
         # nimmt schwachen Clients das Herunterskalieren ab.
         dims = f",width={size[0]},height={size[1]}" if size else ""
+        if (has_element("nvh264enc") and has_element("cudaconvertscale")
+                and not args.software):
+            # NVIDIA (proprietärer Treiber, kein VA-API-Encoding): Skalierung,
+            # Farbkonvertierung und Encoding komplett auf der GPU per NVENC.
+            return (f"video/x-raw ! cudaupload ! cudaconvertscale ! "
+                    f"video/x-raw(memory:CUDAMemory),format=NV12{dims} ! "
+                    f"nvh264enc bitrate={args.bitrate} gop-size={args.fps} bframes=0 "
+                    "preset=p1 tune=ultra-low-latency rc-mode=cbr zerolatency=true "
+                    "rc-lookahead=0 repeat-sequence-header=true")
         if has_element("vah264enc") and not args.software:
             # KWin liefert DMABufs, die vapostproc nicht direkt importieren kann.
             return (f"video/x-raw ! videoconvertscale n-threads=4 ! video/x-raw,format=NV12{dims} ! "
