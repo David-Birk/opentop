@@ -8,7 +8,8 @@ Monitor sein sollen, etwa unter Gentoo/OpenRC als Systemdienst.
 Protokoll, Kopplung und Verschlüsselung sind identisch mit opentop-client.
 
 Strg+Alt+Rücktaste beendet den Client und gibt Bildschirm und Tastatur
-wieder an die Konsole zurück.
+wieder an die Konsole zurück. Strg+Alt+P koppelt einen weiteren Host; der
+zuletzt gekoppelte hat Vorrang, sobald er erreichbar ist.
 """
 import argparse
 import fcntl
@@ -35,9 +36,11 @@ from gi.repository import GLib, Gst, GstRtp
 STALL_TIMEOUT = 3      # s ohne Pakete -> zurück zum Wartebildschirm
 DECODE_TIMEOUT = 8     # s mit Paketen, aber ohne Bild -> nächste Ausgabekette
 REJECT_PAUSE = 60
+HOST_TIMEOUT = 3.5     # s ohne Antwort -> Host gilt als nicht erreichbar
 CONFIG_FILE = os.path.join(proto.CONFIG_DIR, "client.json")
 KEY_FILE = os.path.join(proto.CONFIG_DIR, "client.key")
 QUIT_HINT = "Strg + Alt + Rücktaste  –  zurück zur Konsole"
+PAIR_HINT = "Strg + Alt + P  –  weiteren Host koppeln"
 CREDITS = "developed by David-Birk  ·  github.com/David-Birk"
 SPINNER = "◐◓◑◒"
 
@@ -46,7 +49,7 @@ FG, MUTED, DIM, ACCENT = "#e6e9ef", "#9aa4b2", "#6c7686", "#5c8cf0"
 
 # Linux-Eingabe (linux/input.h, linux/input-event-codes.h)
 EV_KEY = 1
-KEY_BACKSPACE, KEY_A = 14, 30
+KEY_BACKSPACE, KEY_A, KEY_P = 14, 30, 25
 CTRL_KEYS, ALT_KEYS = {29, 97}, {56, 100}
 INPUT_EVENT = struct.Struct("llHHi")
 EVIOCGRAB = 0x40044590
@@ -146,8 +149,8 @@ class Keyboard:
     wieder frei.
     """
 
-    def __init__(self, on_quit, grab=True):
-        self.on_quit = on_quit
+    def __init__(self, hotkeys, grab=True):
+        self.hotkeys = hotkeys  # Taste -> Aktion bei Strg+Alt+Taste
         self.grab = grab
         self.devices = {}  # Pfad -> fd, oder None für Geräte ohne Tasten
         self.pressed = set()
@@ -208,10 +211,9 @@ class Keyboard:
                 self.pressed.add(code)
             else:
                 self.pressed.discard(code)
-            if (value == 1 and code == KEY_BACKSPACE
+            if (value == 1 and code in self.hotkeys
                     and self.pressed & CTRL_KEYS and self.pressed & ALT_KEYS):
-                log("Beendet per Tastenkombination")
-                self.on_quit()
+                self.hotkeys[code]()
         return True
 
     def close(self):
@@ -252,10 +254,17 @@ class Client:
         self.config = proto.load_json(CONFIG_FILE, {})
         if "id" not in self.config:
             self.config["id"] = secrets.token_hex(8)
-            proto.save_json(CONFIG_FILE, self.config)
+        if "host" in self.config:  # alte Konfiguration mit nur einem Host
+            self.config["hosts"] = [self.config.pop("host")]
+        self.config.setdefault("hosts", [])  # Rangfolge: der erste hat Vorrang
+        proto.save_json(CONFIG_FILE, self.config)
+        self.active = None        # Host, von dem gerade gestreamt wird
+        self.seen = {}            # Host-Schlüssel -> letzte Antwort
+        self.sent_seq = {}        # Host-Schlüssel -> zuletzt gesendete Beacon-Nummern
         self.pairing = None
         self.pending_keys = []
-        self.repair = False
+        self.repair = False       # Kopplung mit einem (weiteren) Host läuft
+        self.repair_since = 0.0
         self.rejected_until = 0.0
         self.roc = None
 
@@ -332,10 +341,14 @@ class Client:
             status = "Kopplung wird vorbereitet …"
         elif now < self.rejected_until:
             status = "Kopplung wurde am Host abgelehnt"
-        elif not self.paired or self.repair:
+        elif self.repair:
+            status = "Koppeln – warte auf einen weiteren opentop-Host …"
+        elif not self.paired:
             status = "Nicht gekoppelt – warte auf einen opentop-Host …"
+        elif self.active:
+            status = f"Verbinde mit {self.active['name']} …"
         else:
-            status = f"Warte auf {self.config['host']['name']} …"
+            status = f"Warte auf {' / '.join(h['name'] for h in self.hosts)} …"
         ips = [a["local"] for a in ipv4_addresses()]
         address = f"{self.name}\n{'  ·  '.join(ips) or 'kein Netzwerk'}"
         self.splash_info = (status, code or "", address)
@@ -365,7 +378,10 @@ class Client:
         if code:
             lines += ["", span(code, 72, FG, bold=True, mono=True)]
         lines += ["", span(address, 18, DIM, mono=True), "", "",
-                  span(QUIT_HINT, 14, "#4f5866"), "", "", span(CREDITS, 14, "#5f6a7a")]
+                  span(QUIT_HINT, 14, "#4f5866")]
+        if self.paired and not self.repair:
+            lines += [span(PAIR_HINT, 14, "#4f5866")]
+        lines += ["", "", span(CREDITS, 14, "#5f6a7a")]
         self.splash.get_by_name("text").set_property("text", "\n".join(lines))
 
     def on_splash_error(self, _bus, msg):
@@ -403,7 +419,7 @@ class Client:
             self.sniffer.recv(65536)
         except OSError:
             return True
-        if self.paired and not self.repair and self.chains:
+        if self.active and not self.repair and self.chains:
             GLib.idle_add(self.show_video)
         return True
 
@@ -423,7 +439,7 @@ class Client:
             self.pipeline = None
 
     def build_pipeline(self):
-        caps = proto.srtp_caps(proto.unb64(self.config["host"]["key"]), self.roc)
+        caps = proto.srtp_caps(proto.unb64(self.active["key"]), self.roc)
         desc = video_pipeline(caps, self.args.latency, self.chains[self.chain], self.sink)
         log("Pipeline:", desc.replace(caps, "<srtp>"))
         pipeline = Gst.parse_launch(desc)
@@ -536,22 +552,41 @@ class Client:
     # --- Protokoll (wie opentop-client) ---------------------------------------
 
     @property
+    def hosts(self):
+        return self.config["hosts"]
+
+    @property
     def paired(self):
-        return "host" in self.config
+        return bool(self.hosts)
 
     def send_beacon(self, keyframe=False):
         now = time.monotonic()
         if self.pairing and now - self.pairing["started"] > proto.PAIRING_TIMEOUT:
             log("Kopplung abgelaufen")
             self.pairing = None
+            self.end_repair()
+            self.update_splash()
+        if self.repair and not self.pairing and now - self.repair_since > proto.PAIRING_TIMEOUT:
+            log("Kein weiterer Host gefunden")
+            self.end_repair()
             self.update_splash()
         ident = {"id": self.config["id"], "name": self.name}
         if self.paired and not self.repair:
-            host = self.config["host"]
-            msg = proto.sign({"type": "beacon", **ident, "size": self.size and list(self.size),
-                              "keyframe": keyframe, "host": host["pub"], "seq": time.time_ns()},
-                             proto.unb64(host["key"]))
-        elif self.pairing:
+            self.choose_host()
+            # Jeder gekoppelte Host bekommt einen Beacon; alle außer dem
+            # aktiven nur im Standby: Sie antworten, legen aber keinen
+            # virtuellen Monitor an (oder entfernen ihn wieder).
+            for host in self.hosts:
+                active = host is self.active
+                seq = time.time_ns()
+                self.sent_seq[host["pub"]] = (*self.sent_seq.get(host["pub"], ())[-3:], seq)
+                msg = proto.sign({"type": "beacon", **ident, "size": self.size and list(self.size),
+                                  "keyframe": keyframe and active, "standby": not active,
+                                  "host": host["pub"], "seq": seq},
+                                 proto.unb64(host["key"]))
+                self.broadcast(proto.encode(msg))
+            return True
+        if self.pairing:
             msg = {"type": "nonce", "id": self.config["id"], "nonce": self.pairing["nonce"]}
         elif now >= self.rejected_until:
             msg = {"type": "hello", **ident, "pub": self.identity.pub}
@@ -559,6 +594,39 @@ class Client:
             return True
         self.broadcast(proto.encode(msg))
         return True
+
+    def choose_host(self):
+        """Der erste erreichbare Host in der Rangfolge wird aktiv."""
+        now = time.monotonic()
+        best = next((h for h in self.hosts if now - self.seen.get(h["pub"], -HOST_TIMEOUT) < HOST_TIMEOUT),
+                    None)
+        if best is self.active:
+            return
+        log(f"Wechsle zu {best['name']}" if best else f"{self.active['name']} nicht mehr erreichbar")
+        self.active = best
+        self.roc = None
+        if self.mode == "video":
+            self.show_splash()  # neuer Schlüssel; Video startet mit dessen Paketen
+        self.update_splash()
+        if best:
+            GLib.idle_add(self.send_beacon)  # den neuen Host sofort wecken
+
+    def toggle_repair(self):
+        if self.repair:
+            log("Koppeln abgebrochen")
+            self.pairing = None
+            self.end_repair()
+        else:
+            log("Koppele weiteren Host")
+            self.repair = True
+            self.repair_since = time.monotonic()
+            self.active = None
+            self.show_splash()
+        self.update_splash()
+
+    def end_repair(self):
+        self.repair = False
+        self.seen.clear()  # erst nach neuer Antwort wieder streamen
 
     def broadcast(self, data):
         # Über jedes Interface melden, damit der Host ein direktes Kabel
@@ -574,7 +642,8 @@ class Client:
         msg = proto.decode(data)
         handler = msg and {"commit": self.on_commit, "reveal": self.on_reveal,
                            "paired": self.on_paired, "rejected": self.on_rejected,
-                           "unknown": self.on_unknown, "stream": self.on_stream}.get(msg.get("type"))
+                           "unknown": self.on_unknown, "stream": self.on_stream,
+                           "here": self.on_here}.get(msg.get("type"))
         if handler:
             try:
                 handler(msg, addr)
@@ -615,15 +684,20 @@ class Client:
                 break
         else:
             return
-        self.config["host"] = {"pub": host_pub, "name": str(msg["name"])[:64],
-                               "key": proto.b64(key)}
+        host = {"pub": host_pub, "name": str(msg["name"])[:64], "key": proto.b64(key)}
+        # Ein neuer Host kommt nach vorn und hat damit Vorrang; ein neu
+        # gekoppelter bekannter Host behält seinen Platz.
+        index = next((i for i, h in enumerate(self.hosts) if h["pub"] == host_pub), None)
+        if index is None:
+            self.hosts.insert(0, host)
+        else:
+            self.hosts[index] = host
         proto.save_json(CONFIG_FILE, self.config)
-        log(f"Gekoppelt mit {self.config['host']['name']}")
+        log(f"Gekoppelt mit {host['name']} - Rangfolge:", ", ".join(h["name"] for h in self.hosts))
         self.pairing = None
         self.pending_keys = []
-        self.repair = False
-        if self.mode == "video":
-            self.restart_pipeline()  # neuer Schlüssel
+        self.end_repair()
+        self.active = None
         self.update_splash()
 
     def on_rejected(self, _msg, _addr):
@@ -632,20 +706,32 @@ class Client:
         log("Kopplung abgelehnt")
         self.pairing = None
         self.rejected_until = time.monotonic() + REJECT_PAUSE
+        if self.paired:
+            self.end_repair()  # mit den bekannten Hosts weitermachen
         self.update_splash()
 
     def on_stream(self, msg, _addr):
-        if self.paired and proto.verify(msg, proto.unb64(self.config["host"]["key"])):
+        if self.active and proto.verify(msg, proto.unb64(self.active["key"])):
             self.roc = int(msg["roc"])
 
-    def on_unknown(self, _msg, _addr):
-        # Der Host kennt uns nicht (mehr): neu koppeln. Der alte Schlüssel
-        # bleibt, bis die neue Kopplung bestätigt ist.
-        if self.paired and not self.repair:
-            log("Host kennt diesen Client nicht mehr - koppele neu")
-            self.repair = True
-            self.show_splash()
-            self.update_splash()
+    def on_here(self, msg, _addr):
+        # Antwort eines Hosts auf unseren Beacon. Die Nummer muss zu einem
+        # der letzten Beacons passen, damit alte Antworten nicht zählen.
+        for host in self.hosts:
+            if msg["seq"] in self.sent_seq.get(host["pub"], ()) and proto.verify(msg, proto.unb64(host["key"])):
+                self.seen[host["pub"]] = time.monotonic()
+                if not self.repair:
+                    self.choose_host()
+                return
+
+    def on_unknown(self, msg, _addr):
+        # Der aktive Host kennt uns nicht (mehr): neu koppeln. Der alte
+        # Schlüssel bleibt, bis die neue Kopplung bestätigt ist.
+        if not self.active or msg.get("host", self.active["pub"]) != self.active["pub"]:
+            return
+        if not self.repair:
+            log(f"{self.active['name']} kennt diesen Client nicht mehr - koppele neu")
+            self.toggle_repair()
 
     # --- Ablauf --------------------------------------------------------------
 
@@ -653,7 +739,8 @@ class Client:
         log("Bildschirm:", f"{self.size[0]}x{self.size[1]}" if self.size else "unbekannt",
             "| skip-vsync" if self.skip_vsync else "",
             "| Ausgabeketten:", "; ".join(self.describe(c) for c in self.chains) or "keine")
-        self.keyboard = Keyboard(self.quit, grab=not self.args.no_grab)
+        self.keyboard = Keyboard({KEY_BACKSPACE: self.quit, KEY_P: self.toggle_repair},
+                                 grab=not self.args.no_grab)
         GLib.io_add_watch(self.sock.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, self.on_message)
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.quit)
@@ -675,6 +762,7 @@ class Client:
                 os.close(self.drm_fd)
 
     def quit(self, *_):
+        log("Beende")
         self.loop.quit()
         return False
 

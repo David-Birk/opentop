@@ -201,6 +201,20 @@ Ein Client muss einmalig mit dem Host gekoppelt werden:
 Die Kopplung wird auf beiden Seiten gespeichert. Danach verbindet sich der
 Client bei jedem Start automatisch.
 
+### Mehrere Hosts (Gentoo/KMS-Client)
+
+Der KMS-Client kann mit mehreren Hosts gekoppelt sein und zeigt immer den
+wichtigsten erreichbaren an. <kbd>Strg</kbd>+<kbd>Alt</kbd>+<kbd>P</kbd> koppelt
+einen weiteren Host. Der zuletzt gekoppelte hat Vorrang: Sobald er erreichbar
+ist, wechselt der Client zu ihm, und der bisherige Host entfernt seinen
+virtuellen Monitor. Ist er nicht mehr erreichbar (zugeklappt, ausgeschaltet),
+wechselt der Client nach etwa 4 s zum nächsten. Die Rangfolge steht in
+`client.json` unter `hosts` und lässt sich dort umsortieren.
+
+Dazu schickt der Client allen gekoppelten Hosts signierte Anmeldungen; alle
+außer dem aktiven sind als Standby markiert und bestätigen nur, dass sie
+erreichbar sind.
+
 ### Betrieb
 
 - **Monitor anordnen:** Systemeinstellungen → Anzeige → Ausgabe „Virtual…“.

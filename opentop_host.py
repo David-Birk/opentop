@@ -162,6 +162,13 @@ class Session:
         self.frames = 0
 
     def on_beacon(self, msg, ip):
+        if msg.get("standby"):
+            # Der Client streamt gerade von einem anderen Host.
+            if self.peers:
+                log(f"{self.name} nutzt einen anderen Host")
+                self.peers.clear()
+                self.update_target()
+            return
         if ip not in self.peers:
             log(f"{self.name} erreichbar über {ip}")
         self.peers[ip] = time.monotonic()
@@ -383,6 +390,9 @@ class Host:
             return
         session.last_seq = msg["seq"]
         session.on_beacon(msg, addr[0])
+        # Bestätigt dem Client, dass dieser Host erreichbar ist; danach wählt
+        # er unter mehreren gekoppelten Hosts aus.
+        self.send(proto.sign({"type": "here", "seq": msg["seq"]}, session.key), addr)
         if session.pipeline and addr[0] == session.ip:
             # Ein neu startender Client braucht den Rollover-Zähler, sonst
             # kann er nach 65536 Paketen nichts mehr entschlüsseln.
