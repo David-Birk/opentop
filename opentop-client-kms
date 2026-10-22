@@ -51,6 +51,10 @@ CTRL_KEYS, ALT_KEYS = {29, 97}, {56, 100}
 INPUT_EVENT = struct.Struct("llHHi")
 EVIOCGRAB = 0x40044590
 
+# DRM (drm.h)
+DRM_IOCTL_SET_CLIENT_CAP = 0x4010640D
+DRM_CLIENT_CAP_ATOMIC = 3
+
 
 def EVIOCGBIT_KEY(size):
     return 0x80000000 | (size << 16) | (ord("E") << 8) | (0x20 + EV_KEY)
@@ -79,6 +83,21 @@ def find_display():
         except (OSError, ValueError):
             continue
     return None, None
+
+
+def is_atomic(card):
+    """Ob der DRM-Treiber Atomic Modesetting kann (i915, amdgpu, nouveau, ...)."""
+    try:
+        fd = os.open(card, os.O_RDWR | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fcntl.ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, struct.pack("QQ", DRM_CLIENT_CAP_ATOMIC, 1))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def ipv4_addresses():
@@ -112,7 +131,11 @@ def video_pipeline(caps, latency, chain, sink):
             # Im LAN kommen Pakete in Reihenfolge an; der Jitterbuffer kostet
             # dort nur Latenz und wird erst ab --latency > 0 eingebaut.
             + (f"rtpjitterbuffer latency={latency} drop-on-latency=true ! " if latency else "")
-            + f"rtph264depay name=depay ! h264parse ! {dec} ! identity name=shown ! {post}{sink}")
+            + f"rtph264depay name=depay ! h264parse ! {dec} ! identity name=shown ! {post}"
+            # Eigener Thread für die Ausgabe: Wartet kmssink auf VSync, staut
+            # sich nichts im Socket, sondern ältere Bilder werden verworfen.
+            "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+            f"{sink}")
 
 
 class Keyboard:
@@ -218,6 +241,10 @@ class Client:
         self.name = socket.gethostname()
         self.size, card = find_display()
         self.drm_fd = self.open_drm(card)
+        # Auf Atomic-Treibern wartet schon das Setzen der Ebene auf VSync;
+        # kmssink würde danach ein zweites Mal warten (halbe Bildrate).
+        self.skip_vsync = (self.drm_fd is not None and is_atomic(card)
+                           and "skip-vsync" not in args.sink)
         self.chains = self.output_chains()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -248,7 +275,8 @@ class Client:
     @property
     def sink(self):
         fd = f" fd={self.drm_fd}" if self.drm_fd is not None else ""
-        return f"{self.args.sink}{fd} name=sink sync=false"
+        vsync = " skip-vsync=true" if self.skip_vsync else ""
+        return f"{self.args.sink}{fd}{vsync} name=sink sync=false"
 
     def output_chains(self):
         """Mögliche Ketten Decoder -> Bildschirm, die beste zuerst."""
@@ -618,6 +646,7 @@ class Client:
 
     def run(self):
         log("Bildschirm:", f"{self.size[0]}x{self.size[1]}" if self.size else "unbekannt",
+            "| skip-vsync" if self.skip_vsync else "",
             "| Ausgabeketten:", "; ".join(self.describe(c) for c in self.chains) or "keine")
         self.keyboard = Keyboard(self.quit, grab=not self.args.no_grab)
         GLib.io_add_watch(self.sock.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, self.on_message)

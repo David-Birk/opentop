@@ -21,6 +21,7 @@ Ein Backend stellt bereit:
 Screen.close() entfernt den virtuellen Monitor wieder.
 """
 import argparse
+import collections
 import ipaddress
 import os
 import queue
@@ -74,19 +75,23 @@ class Pacer:
         self.queue = queue.Queue()
         self.max_wait = 0.0      # längste Wartezeit in der Queue seit letzter Statistik
         self.max_pipeline = 0.0  # längste Zeit Capture -> appsink seit letzter Statistik
+        self.captured = collections.deque(maxlen=64)  # Zeitpunkte, zu denen Bilder in den Encoder gingen
+        self.last_pts = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
         threading.Thread(target=self.run, daemon=True).start()
 
     def on_sample(self, sink):
         buf = sink.emit("pull-sample").get_buffer()
-        clock = sink.get_clock()
-        if clock and buf.pts != Gst.CLOCK_TIME_NONE:
-            # pipewiresrc stempelt beim Capture (do-timestamp); die Differenz
-            # zur aktuellen Laufzeit ist die Latenz innerhalb der Pipeline.
-            age = (clock.get_time() - sink.get_base_time() - buf.pts) / Gst.SECOND
-            self.max_pipeline = max(self.max_pipeline, age)
-        self.queue.put((time.perf_counter(), buf.extract_dup(0, buf.get_size())))
+        now = time.perf_counter()
+        # Latenz Encoder-Eingang -> erstes RTP-Paket des Bildes. Zuordnung
+        # über die Reihenfolge: Der Encoder verschiebt die Zeitstempel (um
+        # 1000 h), gibt aber jedes Bild genau einmal aus.
+        if buf.pts != self.last_pts:
+            self.last_pts = buf.pts
+            if self.captured:
+                self.max_pipeline = max(self.max_pipeline, now - self.captured.popleft())
+        self.queue.put((now, buf.extract_dup(0, buf.get_size())))
         return Gst.FlowReturn.OK
 
     def take_stats(self):
@@ -117,7 +122,7 @@ class Pacer:
 
 
 def build_pipeline(backend, source, size, key, args):
-    desc = (f"{source} ! videorate drop-only=true max-rate={args.fps} ! "
+    desc = (f"{source} ! videorate name=rate drop-only=true max-rate={args.fps} ! "
             f"{backend.encoder(size, args)} ! "
             "h264parse config-interval=-1 ! rtph264pay config-interval=-1 pt=96 mtu=1400 ! "
             f"srtpenc name=srtp {proto.SRTPENC_PARAMS} ! "
@@ -208,12 +213,17 @@ class Session:
         self.frames += 1
         return Gst.PadProbeReturn.OK
 
+    def time_frame(self, _pad, _info):
+        # Läuft im selben Thread wie Pacer.on_sample (appsink ohne Sync).
+        self.pacer.captured.append(time.perf_counter())
+        return Gst.PadProbeReturn.OK
+
     def log_stats(self, pipeline):
         if pipeline is not self.pipeline:
             return False
         waiting, wait, latency = self.pacer.take_stats() if self.pacer else (0, 0.0, 0.0)
         log(f"{self.name}: Statistik 5s: {self.frames} Bilder erfasst, "
-            f"Pipeline max {latency * 1000:.0f} ms, Pacer {waiting} Pakete wartend, "
+            f"Encoder max {latency * 1000:.0f} ms, Pacer {waiting} Pakete wartend, "
             f"max {wait * 1000:.0f} ms gewartet")
         self.frames = 0
         return True
@@ -231,6 +241,8 @@ class Session:
         self.pipeline.get_by_name("out").connect("new-sample", self.pacer.on_sample)
         src_pad = self.pipeline.get_by_name("src").get_static_pad("src")
         src_pad.add_probe(Gst.PadProbeType.BUFFER, self.count_frame)
+        self.pipeline.get_by_name("rate").get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self.time_frame)
         src_pad.connect("notify::caps", lambda pad, _: pad.get_current_caps() and
                         log("Quelle:", pad.get_current_caps().to_string()))
         GLib.timeout_add_seconds(5, self.log_stats, self.pipeline)
