@@ -247,7 +247,7 @@ class WindowsBackend:
                              "Siehe README, Abschnitt Windows.")
         self.vdd = VddController()
 
-    def open_screen(self, size, _args, on_ready, on_error):
+    def open_screen(self, _client_id, size, _args, on_ready, on_error):
         return VirtualScreen(self.vdd, size, on_ready, on_error)
 
     def encoder(self, size, args):

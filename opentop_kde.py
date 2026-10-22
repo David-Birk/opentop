@@ -1,7 +1,7 @@
 """opentop-Backend für KDE Plasma unter Wayland.
 
 Virtuelle Monitore über das ScreenCast-Portal, Bild per PipeWire, Encoding mit
-VA-API, Skalierung per kscreen-doctor, Kopplungsdialog per kdialog.
+VA-API, Skalierung und Anordnung per kscreen-doctor, Kopplungsdialog per kdialog.
 """
 import json
 import os
@@ -20,31 +20,44 @@ SOURCE_VIRTUAL = 4
 CURSOR_EMBEDDED = 2
 PERSIST_UNTIL_REVOKED = 2
 TOKEN_FILE = os.path.join(proto.CONFIG_DIR, "restore_token")
+LAYOUT_FILE = os.path.join(proto.CONFIG_DIR, "layouts.json")
+LAYOUT_SAVE_INTERVAL = 10  # s; Anordnung auch bei Absturz des Hosts nicht verlieren
 VIRTUAL_WIDTH = 1920  # KDE legt virtuelle Monitore fest mit 1920x1080 an
 
 
-def virtual_outputs():
+def kscreen_outputs():
     try:
         out = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True).stdout
-        return {o["id"] for o in json.loads(out)["outputs"] if o["name"].startswith("Virtual")}
+        return [o for o in json.loads(out)["outputs"] if o.get("connected")]
     except (OSError, ValueError, KeyError):
-        return set()
+        return []
 
 
-def set_scale(output_id, client_width):
+def is_virtual(output):
+    return output["name"].startswith("Virtual")
+
+
+def virtual_outputs():
+    return {o["id"] for o in kscreen_outputs() if is_virtual(o)}
+
+
+def auto_scale(client_width):
     # Logische Größe des virtuellen Monitors an das Client-Panel angleichen,
     # damit Schrift dort so groß ist wie auf einem nativen Display.
-    scale = max(1.0, round(VIRTUAL_WIDTH / client_width * 20) / 20)
-    log(f"Skalierung von Ausgabe {output_id} auf {scale:g}")
-    subprocess.Popen(["kscreen-doctor", f"output.{output_id}.scale.{scale:g}"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return max(1.0, round(VIRTUAL_WIDTH / client_width * 20) / 20)
+
+
+def logical_right(output):
+    return output["pos"]["x"] + output["size"]["width"] / (output.get("scale") or 1)
 
 
 class VirtualScreen:
     """ScreenCast-Portal-Sitzung mit einem virtuellen Monitor als Quelle."""
 
-    def __init__(self, bus, size, args, on_ready, on_error):
+    def __init__(self, bus, client_id, size, args, on_ready, on_error):
         self.bus = bus
+        self.client_id = client_id
+        self.output_id = None
         portal = bus.get_object(PORTAL_BUS, PORTAL_PATH)
         self.screencast = dbus.Interface(portal, "org.freedesktop.portal.ScreenCast")
         self.sender = bus.get_unique_name()[1:].replace(".", "_")
@@ -100,9 +113,11 @@ class VirtualScreen:
             node_id = int(results["streams"][0][0])
             fd = self.screencast.OpenPipeWireRemote(
                 self.session, dbus.Dictionary({}, signature="sv")).take()
-            if self.autoscale:
-                for output_id in virtual_outputs() - self.outputs_before:
-                    set_scale(output_id, self.size[0])
+            new = virtual_outputs() - self.outputs_before
+            if len(new) == 1:
+                self.output_id = new.pop()
+                self.restore_layout()
+                GLib.timeout_add_seconds(LAYOUT_SAVE_INTERVAL, self.save_layout)
             # path= nimmt die Node-ID (target-object erwartet die Serial). Ohne
             # dont-fallback weicht PipeWire sonst still auf die Webcam aus.
             self.on_ready(
@@ -113,9 +128,53 @@ class VirtualScreen:
         self._call("CreateSession", options={"session_handle_token": f"opentop{os.getpid()}"},
                    on_response=created)
 
+    # KWin erkennt den virtuellen Monitor bei jedem Verbinden als neues Gerät
+    # und vergisst dessen Anordnung. Darum merkt sich opentop sie pro Client:
+    # Position und Skalierung des virtuellen Monitors und die Positionen der
+    # übrigen Monitore, die ja um ihn herum angeordnet wurden.
+
+    def restore_layout(self):
+        layout = proto.load_json(LAYOUT_FILE, {}).get(self.client_id)
+        others = {o["name"]: o for o in kscreen_outputs() if not is_virtual(o) and o.get("enabled")}
+        ops = []
+        if layout and set(layout["outputs"]) == set(others):
+            scale = layout["scale"]
+            x, y = layout["virtual"]
+            ops += [f"output.{name}.position.{px},{py}" for name, (px, py) in layout["outputs"].items()]
+            log(f"Stelle Anordnung des virtuellen Monitors wieder her ({x},{y}, Skalierung {scale:g})")
+        else:
+            # Erstes Mal oder andere Monitore: rechts an den letzten anlegen.
+            # Erst nach dem Skalieren, sonst entsteht eine Lücke.
+            scale = auto_scale(self.size[0]) if self.autoscale else None
+            x, y = round(max(map(logical_right, others.values()), default=0)), 0
+            log(f"Virtueller Monitor rechts angelegt bei {x},0"
+                + (f", Skalierung {scale:g}" if scale else ""))
+        if scale:
+            ops.append(f"output.{self.output_id}.scale.{scale:g}")
+        ops.append(f"output.{self.output_id}.position.{x},{y}")
+        subprocess.run(["kscreen-doctor", *ops], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def save_layout(self):
+        if not self.session:
+            return False
+        outputs = kscreen_outputs()
+        virtual = next((o for o in outputs if o["id"] == self.output_id), None)
+        if virtual is None:
+            return True
+        layouts = proto.load_json(LAYOUT_FILE, {})
+        layout = {"scale": virtual.get("scale") or 1,
+                  "virtual": [virtual["pos"]["x"], virtual["pos"]["y"]],
+                  "outputs": {o["name"]: [o["pos"]["x"], o["pos"]["y"]] for o in outputs
+                              if not is_virtual(o) and o.get("enabled")}}
+        if layouts.get(self.client_id) != layout:
+            layouts[self.client_id] = layout
+            proto.save_json(LAYOUT_FILE, layouts)
+        return True
+
     def close(self):
         if not self.session:
             return
+        self.save_layout()
         try:
             obj = self.bus.get_object(PORTAL_BUS, self.session)
             dbus.Interface(obj, "org.freedesktop.portal.Session").Close()
@@ -145,8 +204,8 @@ class KdeBackend:
         DBusGMainLoop(set_as_default=True)
         self.bus = dbus.SessionBus()
 
-    def open_screen(self, size, args, on_ready, on_error):
-        return VirtualScreen(self.bus, size, args, on_ready, on_error)
+    def open_screen(self, client_id, size, args, on_ready, on_error):
+        return VirtualScreen(self.bus, client_id, size, args, on_ready, on_error)
 
     def encoder(self, size, args):
         # Auf die Panel-Auflösung des Clients skalieren: spart Bandbreite und

@@ -9,7 +9,7 @@ Ein Backend stellt bereit:
 
     name                                Anzeigename für das Log
     setup()                             einmalig vor dem Mainloop
-    open_screen(size, args, on_ready, on_error) -> Screen
+    open_screen(client_id, size, args, on_ready, on_error) -> Screen
         legt einen virtuellen Monitor an (size = Client-Auflösung oder None)
         und ruft danach on_ready(source) auf. source ist eine GStreamer-
         Beschreibung, deren Quellelement name=src trägt.
@@ -25,6 +25,7 @@ import collections
 import ipaddress
 import os
 import queue
+import signal
 import socket
 import sys
 import threading
@@ -245,7 +246,7 @@ class Session:
     def start(self, ip):
         self.ip = ip
         self.host.starting = self
-        self.screen = self.backend.open_screen(self.size, self.host.args,
+        self.screen = self.backend.open_screen(self.id, self.size, self.host.args,
                                                self.on_ready, self.on_error)
 
     def on_ready(self, source):
@@ -337,7 +338,13 @@ class Host:
         proto.watch_socket(self.sock, self.on_message)
         GLib.timeout_add_seconds(1, self.check_timeout)
         log(f"Backend {self.backend.name}, warte auf opentop-clients (UDP {proto.BEACON_PORT}) ...")
-        GLib.MainLoop().run()
+        loop = GLib.MainLoop()
+        if hasattr(GLib, "unix_signal_add"):
+            # Sauber beenden, damit stop() die virtuellen Monitore schließt
+            # (und das Backend dabei ihre Anordnung speichert).
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+        loop.run()
 
     def load_clients(self):
         # Neu einlesen, falls "opentop-host --forget" die Datei geändert hat.

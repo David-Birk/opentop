@@ -218,7 +218,9 @@ erreichbar sind.
 ### Betrieb
 
 - **Monitor anordnen:** Systemeinstellungen → Anzeige → Ausgabe „Virtual…“.
-  Plasma speichert die Position.
+  opentop merkt sich Position und Skalierung pro Client (`layouts.json`) und
+  stellt sie beim nächsten Verbinden wieder her, weil KWin den virtuellen
+  Monitor jedes Mal als neues Gerät sieht.
 - **Host ein- und ausschalten:** Menüeintrag **opentop** oder
   `systemctl --user start|stop opentop-host`.
 - **Client normal verwenden:** <kbd>Strg</kbd>+<kbd>Alt</kbd>+<kbd>Rücktaste</kbd>
