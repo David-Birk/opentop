@@ -156,7 +156,10 @@ class KdeBackend:
             # NVIDIA (proprietärer Treiber, kein VA-API-Encoding): NVENC.
             nvenc = (f"nvh264enc bitrate={args.bitrate} gop-size={args.fps} bframes=0 "
                      "preset=p1 tune=ultra-low-latency rc-mode=cbr zerolatency=true "
-                     "rc-lookahead=0 repeat-sequence-header=true")
+                     "rc-lookahead=0 repeat-sequence-header=true ! "
+                     # Baseline enthält per Definition keine Umsortierung, sonst
+                     # puffert der Decoder am Client bis zu 16 Bilder (Delay).
+                     "video/x-h264,profile=constrained-baseline")
             if has_element("cudaconvertscale"):
                 # Mit NVRTC (Paket cuda) auch Skalierung und Konvertierung auf der GPU.
                 return (f"video/x-raw ! cudaupload ! cudaconvertscale ! "

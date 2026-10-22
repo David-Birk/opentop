@@ -254,9 +254,13 @@ class Client:
         """Mögliche Ketten Decoder -> Bildschirm, die beste zuerst."""
         chains = []
         if not self.args.software and has_element("vah264dec"):
-            chains.append(("vah264dec", ""))  # ohne Kopie, sofern kmssink DMABuf annimmt
+            # Der Host sendet nie B-Frames. Fehlt im Stream die Angabe dazu
+            # (NVENC schreibt sie nicht), hält der Decoder sonst bis zu 16
+            # Bilder zurück - bei ~2 fps auf ruhigem Desktop sind das Sekunden.
+            dec = "vah264dec compliance=flexible"
+            chains.append((dec, ""))  # ohne Kopie, sofern kmssink DMABuf annimmt
             if has_element("vapostproc"):
-                chains.append(("vah264dec", "vapostproc ! video/x-raw,format=BGRx ! "))
+                chains.append((dec, "vapostproc ! video/x-raw,format=BGRx ! "))
         for dec in ("avdec_h264", "openh264dec"):
             if has_element(dec):
                 chains.append((dec, "videoconvert ! video/x-raw,format=BGRx ! "))

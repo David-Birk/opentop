@@ -333,7 +333,10 @@ class Client:
             self.update_splash()
 
     def build_pipeline(self):
-        dec = "vah264dec" if has_element("vah264dec") and not self.args.software else "avdec_h264"
+        # compliance=flexible: Bilder sofort ausgeben; der Host sendet nie
+        # B-Frames, und ohne Angabe im Stream (NVENC) würde der Decoder puffern.
+        dec = ("vah264dec compliance=flexible" if has_element("vah264dec") and not self.args.software
+               else "avdec_h264")
         caps = proto.srtp_caps(proto.unb64(self.config["host"]["key"]))
         desc = (f"udpsrc name=src port={proto.STREAM_PORT} buffer-size=4194304 caps=\"{caps}\" ! "
                 "srtpdec name=srtp ! "
