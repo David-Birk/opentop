@@ -1,0 +1,27 @@
+#!/sbin/openrc-run
+# opentop-client-kms als Systemdienst: dieser Laptop zeigt beim Booten direkt
+# den zweiten Monitor an, ohne Anmeldung, Desktop oder Compositor.
+
+description="opentop – dieser Laptop als zweiter Monitor (KMS)"
+
+: "${OPENTOP_USER:=opentop}"
+: "${OPENTOP_HOME:=/var/lib/opentop}"
+
+command="/usr/local/bin/opentop-client-kms"
+command_args="${OPENTOP_ARGS}"
+command_user="${OPENTOP_USER}:${OPENTOP_USER}"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+start_stop_daemon_args="--env HOME=${OPENTOP_HOME} --env XDG_CONFIG_HOME=${OPENTOP_HOME}/.config"
+output_logger="logger -t opentop-client -p user.info"
+error_logger="logger -t opentop-client -p user.err"
+
+depend() {
+	need localmount
+	use net logger NetworkManager dhcpcd
+	after bootmisc
+}
+
+start_pre() {
+	checkpath -d -o "${OPENTOP_USER}:${OPENTOP_USER}" -m 0700 "${OPENTOP_HOME}"
+}

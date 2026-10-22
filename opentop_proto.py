@@ -24,9 +24,34 @@ import json
 import os
 import secrets
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+# X25519 kommt aus python-cryptography oder, falls das fehlt, aus PyNaCl
+# (libsodium). PyNaCl braucht kein Rust und ist auf schwachen Clients, die
+# alles selbst kompilieren (z.B. Gentoo), deutlich schneller installiert.
+# Beide liefern bitgleiche Schlüssel, Host und Client dürfen sie mischen.
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+
+    def _x25519_public(private):
+        return X25519PrivateKey.from_private_bytes(private).public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+    def _x25519_exchange(private, peer_public):
+        return X25519PrivateKey.from_private_bytes(private).exchange(
+            X25519PublicKey.from_public_bytes(peer_public))
+except ImportError:
+    from nacl.bindings import crypto_scalarmult, crypto_scalarmult_base
+
+    def _x25519_public(private):
+        return crypto_scalarmult_base(private)
+
+    def _x25519_exchange(private, peer_public):
+        if len(peer_public) != 32:
+            raise ValueError("Ungültiger öffentlicher Schlüssel")
+        try:
+            return crypto_scalarmult(private, peer_public)
+        except Exception as e:  # libsodium lehnt Punkte kleiner Ordnung ab
+            raise ValueError(str(e)) from e
 
 VERSION = 2
 BEACON_PORT = 47800
@@ -119,29 +144,38 @@ class Identity:
     def __init__(self, path):
         try:
             with open(path, "rb") as f:
-                self.key = X25519PrivateKey.from_private_bytes(f.read())
+                self.key = f.read()
+            if len(self.key) != 32:
+                raise ValueError("Schlüsseldatei beschädigt")
         except (OSError, ValueError):
-            self.key = X25519PrivateKey.generate()
+            self.key = secrets.token_bytes(32)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "wb") as f:
-                f.write(self.key.private_bytes(serialization.Encoding.Raw,
-                                               serialization.PrivateFormat.Raw,
-                                               serialization.NoEncryption()))
-        self.pub = b64(self.key.public_key().public_bytes(serialization.Encoding.Raw,
-                                                          serialization.PublicFormat.Raw))
+                f.write(self.key)
+        self.pub = b64(_x25519_public(self.key))
 
     def shared(self, peer_pub):
-        return self.key.exchange(X25519PublicKey.from_public_bytes(unb64(peer_pub)))
+        return _x25519_exchange(self.key, unb64(peer_pub))
 
 
 def commitment(host_pub, client_pub, host_nonce):
     return hashlib.sha256(f"opentop-commit|{host_pub}|{client_pub}|{host_nonce}".encode()).hexdigest()
 
 
+def hkdf_sha256(key, length, salt, info):
+    """HKDF nach RFC 5869 mit SHA-256; ohne salt wie üblich 32 Nullbytes."""
+    prk = hmac.new(salt or bytes(32), key, hashlib.sha256).digest()
+    out, block = b"", b""
+    for counter in range(1, -(-length // 32) + 1):
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        out += block
+    return out[:length]
+
+
 def _derive(shared, host_pub, client_pub, client_nonce, host_nonce, info, length):
     salt = hashlib.sha256(f"{host_pub}|{client_pub}|{client_nonce}|{host_nonce}".encode()).digest()
-    return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(shared)
+    return hkdf_sha256(shared, length, salt, info)
 
 
 def pairing_code(shared, host_pub, client_pub, client_nonce, host_nonce):
@@ -156,7 +190,7 @@ def session_key(shared, host_pub, client_pub, client_nonce, host_nonce):
 
 def srtp_key(key):
     # 16 Byte AES-Schlüssel + 14 Byte Salt für aes-128-icm.
-    return HKDF(algorithm=hashes.SHA256(), length=30, salt=None, info=b"opentop srtp").derive(key)
+    return hkdf_sha256(key, 30, None, b"opentop srtp")
 
 
 def srtp_caps(key):

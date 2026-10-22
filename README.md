@@ -97,7 +97,7 @@ Sekunden aus, wird der Monitor wieder entfernt.
 
 |              | Host                                         | Client                                     |
 |--------------|----------------------------------------------|--------------------------------------------|
-| System       | Arch Linux mit KDE Plasma 6 unter Wayland; Windows 10/11 experimentell | Arch Linux, beliebige Desktop-Umgebung |
+| System       | Arch Linux mit KDE Plasma 6 unter Wayland; Windows 10/11 experimentell | Arch Linux, beliebige Desktop-Umgebung; Gentoo mit OpenRC ohne Desktop |
 | Grafik       | GPU mit VA-API (sonst Software-Encoding)     | GPU mit VA-API empfohlen                   |
 | Netzwerk     | Gleiches Subnetz wie der Client              | Gleiches Subnetz wie der Host              |
 
@@ -149,6 +149,41 @@ Ohne Treiber dekodiert der Client in Software, was auf schwachen Prozessoren zu
 deutlichem Ruckeln führt.
 
 Beide Skripte öffnen bei aktivem `firewalld` oder `ufw` die benötigten Ports.
+
+### Client unter Gentoo/OpenRC (minimal)
+
+Für Laptops, die ausschließlich zweiter Monitor sein sollen, gibt es mit
+`opentop-client-kms` eine schlanke Variante. Sie braucht weder Desktop noch
+Display-Manager, Compositor, GTK oder Mesa: Der Client läuft als
+OpenRC-Dienst und gibt das Bild per `kmssink` direkt über DRM/KMS aus. Den
+Wartebildschirm zeichnet GStreamer selbst (`textoverlay`). Für die Kopplung
+genügt PyNaCl (libsodium) statt `python-cryptography`, sodass auch kein Rust
+kompiliert werden muss.
+
+```sh
+./install-client-gentoo.sh          # als root
+rc-service opentop-client start     # oder neu starten
+```
+
+Das Skript setzt die nötigen USE-Flags (GStreamer ohne OpenGL, X11 und
+Wayland, mit VA-API) und schaltet `kmssink` für `gst-plugins-bad` per
+`/etc/portage/env` ein, da Gentoo es sonst nicht baut. Außerdem installiert es
+den VA-API-Treiber für Intel-GPUs und legt den Systembenutzer `opentop`
+(Gruppen `video` und `input`) sowie den Dienst `opentop-client` an. Optionen
+stehen in `/etc/conf.d/opentop-client`.
+
+| Option         | Zweck                                                          |
+|----------------|----------------------------------------------------------------|
+| `--link IFACE` | NetworkManager-Profil mit Link-Local-Adresse für ein Kabel      |
+| `--user NAME`  | anderer Benutzer für den Dienst                                |
+| `--software`   | zusätzlich Software-Decoder (ffmpeg) installieren              |
+| `--start`      | Dienst sofort starten                                          |
+
+`Strg`+`Alt`+`Rücktaste` beendet den Client und gibt Bildschirm und Tastatur
+an die Konsole zurück. Das Protokoll landet per Syslog in
+`/var/log/messages` (Kennung `opentop-client`). Falls `vah264dec` mit
+DMABuf nicht ausgeben kann, weicht der Client automatisch auf `vapostproc`
+bzw. Software-Decoding aus.
 
 ## Erste Schritte
 
@@ -317,11 +352,13 @@ journalctl -t opentop-client -f        # Client: Pakete, Verluste, angezeigte Bi
 | `opentop_kde.py`           | Host-Backend für KDE Plasma (Portal, PipeWire, VA-API)       |
 | `opentop_windows.py`       | Host-Backend für Windows (experimentell)                     |
 | `opentop-client`           | Client: Kopplung, Empfang, Decoding, Vollbildanzeige         |
-| `opentop_proto.py`         | Gemeinsames Protokoll und Kryptografie                       |
+| `opentop-client-kms`       | Schlanker Client ohne Desktop, Ausgabe direkt per KMS        |
+| `opentop_proto.py`         | Gemeinsames Protokoll und Kryptografie (cryptography oder PyNaCl) |
 | `install-host.sh`          | Installation auf dem Host (Linux)                            |
 | `install-host-windows.ps1` | Installation auf dem Host (Windows, experimentell)           |
 | `install-client.sh`        | Installation auf dem Client                                  |
-| `data/`                    | systemd-Dienst, Menüeintrag und Login-Sitzung                |
+| `install-client-gentoo.sh` | Installation des KMS-Clients unter Gentoo/OpenRC             |
+| `data/`                    | systemd- und OpenRC-Dienst, Menüeintrag und Login-Sitzung    |
 
 ## Lizenz
 

@@ -1,0 +1,10 @@
+# Optionen für opentop-client-kms, zum Beispiel:
+#   --latency 30          Jitterbuffer für WLAN
+#   --host 192.168.1.10   Host direkt anschreiben statt per Broadcast
+#   --software            Software-Decoder statt VA-API
+OPENTOP_ARGS=""
+
+# Benutzer, unter dem der Client läuft (Gruppen video und input).
+# Kopplung und Schlüssel liegen in OPENTOP_HOME/.config/opentop.
+OPENTOP_USER="opentop"
+OPENTOP_HOME="/var/lib/opentop"

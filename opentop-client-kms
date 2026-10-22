@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""opentop-client-kms: schlanker opentop-Client ohne Desktop, GTK und Compositor.
+
+Gibt den Stream per kmssink direkt auf dem Bildschirm aus (DRM/KMS) und
+braucht dafür nur Python, PyGObject, GStreamer und VA-API – kein GTK, kein
+Mesa, kein Wayland. Gedacht für schwache Laptops, die nur noch zweiter
+Monitor sein sollen, etwa unter Gentoo/OpenRC als Systemdienst.
+Protokoll, Kopplung und Verschlüsselung sind identisch mit opentop-client.
+
+Strg+Alt+Rücktaste beendet den Client und gibt Bildschirm und Tastatur
+wieder an die Konsole zurück.
+"""
+import argparse
+import fcntl
+import glob
+import json
+import os
+import secrets
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+sys.path[:0] = [os.path.dirname(os.path.realpath(__file__)), "/usr/local/share/opentop"]
+import opentop_proto as proto
+
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstRtp", "1.0")
+from gi.repository import GLib, Gst, GstRtp
+
+STALL_TIMEOUT = 3      # s ohne Pakete -> zurück zum Wartebildschirm
+DECODE_TIMEOUT = 8     # s mit Paketen, aber ohne Bild -> nächste Ausgabekette
+REJECT_PAUSE = 60
+CONFIG_FILE = os.path.join(proto.CONFIG_DIR, "client.json")
+KEY_FILE = os.path.join(proto.CONFIG_DIR, "client.key")
+QUIT_HINT = "Strg + Alt + Rücktaste  –  zurück zur Konsole"
+CREDITS = "developed by David-Birk  ·  github.com/David-Birk"
+SPINNER = "◐◓◑◒"
+
+BACKGROUND = 0xFF101318  # ARGB, wie der GTK-Client
+FG, MUTED, DIM, ACCENT = "#e6e9ef", "#9aa4b2", "#6c7686", "#5c8cf0"
+
+# Linux-Eingabe (linux/input.h, linux/input-event-codes.h)
+EV_KEY = 1
+KEY_BACKSPACE, KEY_A = 14, 30
+CTRL_KEYS, ALT_KEYS = {29, 97}, {56, 100}
+INPUT_EVENT = struct.Struct("llHHi")
+EVIOCGRAB = 0x40044590
+
+
+def EVIOCGBIT_KEY(size):
+    return 0x80000000 | (size << 16) | (ord("E") << 8) | (0x20 + EV_KEY)
+
+
+def log(*args):
+    print("[opentop]", *args, flush=True)
+
+
+def has_element(name):
+    return Gst.ElementFactory.find(name) is not None
+
+
+def find_display():
+    """Native Auflösung und DRM-Gerät des ersten angeschlossenen Displays."""
+    for status in sorted(glob.glob("/sys/class/drm/card*-*/status")):
+        try:
+            with open(status) as f:
+                if f.read().strip() != "connected":
+                    continue
+            connector = os.path.dirname(status)
+            with open(os.path.join(connector, "modes")) as f:
+                w, h = f.readline().strip().split("x")
+            card = os.path.basename(connector).split("-")[0]
+            return (int(w), int(h)), f"/dev/dri/{card}"
+        except (OSError, ValueError):
+            continue
+    return None, None
+
+
+def ipv4_addresses():
+    try:
+        out = subprocess.run(["ip", "-j", "-4", "addr", "show", "up"],
+                             capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return [a for iface in json.loads(out) if iface["ifname"] != "lo"
+            for a in iface.get("addr_info", [])]
+
+
+def broadcast_addresses():
+    addrs = {a["broadcast"] for a in ipv4_addresses() if a.get("broadcast")}
+    return sorted(addrs) or ["255.255.255.255"]
+
+
+def splash_pipeline(size, sink):
+    w, h = size or (1280, 720)
+    return (f"videotestsrc is-live=true pattern=solid-color foreground-color={BACKGROUND} ! "
+            f"video/x-raw,format=BGRx,width={w},height={h},framerate=2/1 ! "
+            "textoverlay name=text halignment=center valignment=center line-alignment=center "
+            "draw-shadow=false draw-outline=false shaded-background=false ! "
+            f"{sink}")
+
+
+def video_pipeline(caps, latency, chain, sink):
+    dec, post = chain
+    return (f"udpsrc name=src port={proto.STREAM_PORT} buffer-size=4194304 caps=\"{caps}\" ! "
+            "srtpdec name=srtp ! "
+            # Im LAN kommen Pakete in Reihenfolge an; der Jitterbuffer kostet
+            # dort nur Latenz und wird erst ab --latency > 0 eingebaut.
+            + (f"rtpjitterbuffer latency={latency} drop-on-latency=true ! " if latency else "")
+            + f"rtph264depay name=depay ! h264parse ! {dec} ! identity name=shown ! {post}{sink}")
+
+
+class Keyboard:
+    """Liest Tasten direkt aus /dev/input (Gruppe input), ganz ohne Compositor.
+
+    Die Tastaturen werden exklusiv belegt, damit Eingaben nicht unsichtbar in
+    der Konsole darunter landen. Beim Beenden gibt der Kernel sie automatisch
+    wieder frei.
+    """
+
+    def __init__(self, on_quit, grab=True):
+        self.on_quit = on_quit
+        self.grab = grab
+        self.devices = {}  # Pfad -> fd, oder None für Geräte ohne Tasten
+        self.pressed = set()
+        self.scan()
+        GLib.timeout_add_seconds(5, self.scan)
+
+    def scan(self):
+        for path in [p for p, fd in self.devices.items() if fd is None and not os.path.exists(p)]:
+            del self.devices[path]
+        for path in sorted(glob.glob("/dev/input/event*")):
+            if path in self.devices:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            except OSError:
+                continue  # keine Rechte; die Gruppe input fehlt
+            if not self.is_keyboard(fd):
+                os.close(fd)
+                self.devices[path] = None
+                continue
+            if self.grab:
+                try:
+                    fcntl.ioctl(fd, EVIOCGRAB, 1)
+                except OSError as e:
+                    log(f"Tastatur {path} nicht exklusiv belegbar:", e)
+            GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_ERR | GLib.IO_HUP,
+                              self.on_input, path)
+            self.devices[path] = fd
+            log(f"Tastatur {path}")
+        return True
+
+    @staticmethod
+    def is_keyboard(fd):
+        bits = bytearray(96)  # KEY_MAX = 0x2ff
+        try:
+            fcntl.ioctl(fd, EVIOCGBIT_KEY(len(bits)), bits, True)
+        except OSError:
+            return False
+        has = lambda code: bits[code // 8] >> (code % 8) & 1  # noqa: E731
+        return bool(has(KEY_BACKSPACE) and has(KEY_A))
+
+    def on_input(self, fd, cond, path):
+        try:
+            data = b"" if cond & (GLib.IO_ERR | GLib.IO_HUP) else os.read(fd, INPUT_EVENT.size * 64)
+        except BlockingIOError:
+            return True
+        except OSError:
+            data = b""
+        if not data:  # Gerät abgezogen
+            os.close(fd)
+            self.devices.pop(path, None)
+            return False
+        for offset in range(0, len(data) - INPUT_EVENT.size + 1, INPUT_EVENT.size):
+            _sec, _usec, etype, code, value = INPUT_EVENT.unpack_from(data, offset)
+            if etype != EV_KEY:
+                continue
+            if value:
+                self.pressed.add(code)
+            else:
+                self.pressed.discard(code)
+            if (value == 1 and code == KEY_BACKSPACE
+                    and self.pressed & CTRL_KEYS and self.pressed & ALT_KEYS):
+                log("Beendet per Tastenkombination")
+                self.on_quit()
+        return True
+
+    def close(self):
+        for fd in self.devices.values():
+            if fd is not None:
+                os.close(fd)
+        self.devices.clear()
+
+
+class Client:
+    def __init__(self, args):
+        self.args = args
+        self.loop = GLib.MainLoop()
+        self.mode = None          # "splash" oder "video"
+        self.splash = None
+        self.pipeline = None
+        self.sniffer = None
+        self.last_buffer = 0.0
+        self.last_seq = None
+        self.last_frame = 0.0
+        self.video_since = 0.0
+        self.chain = 0
+        self.chain_frames = 0
+        self.spin = 0
+        self.splash_info = ("", "", "")
+        self.stats = {"packets": 0, "lost": 0, "frames": 0}
+        self.name = socket.gethostname()
+        self.size, card = find_display()
+        self.drm_fd = self.open_drm(card)
+        self.chains = self.output_chains()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.identity = proto.Identity(KEY_FILE)
+        self.config = proto.load_json(CONFIG_FILE, {})
+        if "id" not in self.config:
+            self.config["id"] = secrets.token_hex(8)
+            proto.save_json(CONFIG_FILE, self.config)
+        self.pairing = None
+        self.pending_keys = []
+        self.repair = False
+        self.rejected_until = 0.0
+
+    # --- Anzeige -----------------------------------------------------------
+
+    def open_drm(self, card):
+        # Ein eigenes DRM-fd für beide Pipelines: Wir bleiben DRM-Master,
+        # während zwischen Wartebildschirm und Video gewechselt wird, und die
+        # Konsole blitzt dabei nicht kurz auf.
+        if not card or not self.args.sink.startswith("kmssink"):
+            return None
+        try:
+            return os.open(card, os.O_RDWR | os.O_CLOEXEC)
+        except OSError as e:
+            log(f"{card} nicht nutzbar ({e}) - ist der Benutzer in der Gruppe video?")
+            return None
+
+    @property
+    def sink(self):
+        fd = f" fd={self.drm_fd}" if self.drm_fd is not None else ""
+        return f"{self.args.sink}{fd} name=sink sync=false"
+
+    def output_chains(self):
+        """Mögliche Ketten Decoder -> Bildschirm, die beste zuerst."""
+        chains = []
+        if not self.args.software and has_element("vah264dec"):
+            chains.append(("vah264dec", ""))  # ohne Kopie, sofern kmssink DMABuf annimmt
+            if has_element("vapostproc"):
+                chains.append(("vah264dec", "vapostproc ! video/x-raw,format=BGRx ! "))
+        for dec in ("avdec_h264", "openh264dec"):
+            if has_element(dec):
+                chains.append((dec, "videoconvert ! video/x-raw,format=BGRx ! "))
+                break
+        return chains
+
+    def describe(self, chain):
+        dec, post = chain
+        return f"{dec} ! {post}{self.args.sink.split()[0]}"
+
+    def show_splash(self):
+        if self.mode == "splash":
+            return
+        self.stop_video()
+        self.mode = "splash"
+        try:
+            self.splash = Gst.parse_launch(splash_pipeline(self.size, self.sink))
+        except GLib.Error as e:
+            log("Wartebildschirm nicht möglich:", e.message)
+            self.splash = None
+        else:
+            self.watch_bus(self.splash, self.on_splash_error)
+            self.update_splash()
+            self.splash.set_state(Gst.State.PLAYING)
+        self.start_sniffer()
+
+    def stop_splash(self):
+        if self.splash:
+            self.splash.set_state(Gst.State.NULL)
+            self.splash = None
+
+    def update_splash(self):
+        now = time.monotonic()
+        code = self.pairing and self.pairing.get("code")
+        if not self.chains:
+            status = "Kein H.264-Decoder gefunden – siehe Protokoll"
+        elif code:
+            status = "Kopplungscode – bitte am Host bestätigen"
+        elif self.pairing:
+            status = "Kopplung wird vorbereitet …"
+        elif now < self.rejected_until:
+            status = "Kopplung wurde am Host abgelehnt"
+        elif not self.paired or self.repair:
+            status = "Nicht gekoppelt – warte auf einen opentop-Host …"
+        else:
+            status = f"Warte auf {self.config['host']['name']} …"
+        ips = [a["local"] for a in ipv4_addresses()]
+        address = f"{self.name}\n{'  ·  '.join(ips) or 'kein Netzwerk'}"
+        self.splash_info = (status, code or "", address)
+        self.render_splash()
+        return True
+
+    def tick(self):
+        self.spin = (self.spin + 1) % len(SPINNER)
+        self.render_splash()
+        return True
+
+    def render_splash(self):
+        if not self.splash:
+            return
+        scale = (self.size[1] if self.size else 720) / 768
+
+        def span(text, px, color, bold=False, mono=False):
+            # Pango rechnet in Punkt bei 96 dpi: 1 px = 0.75 pt.
+            attrs = (f"size='{int(px * scale * 0.75 * 1024)}' foreground='{color}'"
+                     + (" weight='bold'" if bold else "")
+                     + (" font_family='monospace'" if mono else ""))
+            return f"<span {attrs}>{GLib.markup_escape_text(text, -1)}</span>"
+
+        status, code, address = self.splash_info
+        lines = [span("opentop", 64, FG, bold=True), "",
+                 span(SPINNER[self.spin], 22, ACCENT) + span("  " + status, 22, MUTED)]
+        if code:
+            lines += ["", span(code, 72, FG, bold=True, mono=True)]
+        lines += ["", span(address, 18, DIM, mono=True), "", "",
+                  span(QUIT_HINT, 14, "#4f5866"), "", "", span(CREDITS, 14, "#5f6a7a")]
+        self.splash.get_by_name("text").set_property("text", "\n".join(lines))
+
+    def on_splash_error(self, _bus, msg):
+        err, dbg = msg.parse_error()
+        log("Fehler im Wartebildschirm:", err.message, dbg or "")
+        self.stop_splash()
+
+    # Solange der Wartebildschirm läuft, lauscht ein einfacher Socket auf dem
+    # Videoport. Sobald der Host sendet, übernimmt die Video-Pipeline.
+
+    def start_sniffer(self):
+        if self.sniffer:
+            return
+        self.sniffer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sniffer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sniffer.bind(("0.0.0.0", proto.STREAM_PORT))
+        except OSError as e:
+            log(f"UDP-Port {proto.STREAM_PORT} belegt:", e)
+            self.sniffer.close()
+            self.sniffer = None
+            return
+        self.sniffer.setblocking(False)
+        self.sniffer_watch = GLib.io_add_watch(self.sniffer.fileno(), GLib.PRIORITY_DEFAULT,
+                                               GLib.IO_IN, self.on_stream_packet)
+
+    def stop_sniffer(self):
+        if self.sniffer:
+            GLib.source_remove(self.sniffer_watch)
+            self.sniffer.close()
+            self.sniffer = None
+
+    def on_stream_packet(self, *_):
+        try:
+            self.sniffer.recv(65536)
+        except OSError:
+            return True
+        if self.paired and not self.repair and self.chains:
+            GLib.idle_add(self.show_video)
+        return True
+
+    # --- Video -------------------------------------------------------------
+
+    def show_video(self):
+        if self.mode != "video":
+            self.stop_sniffer()
+            self.stop_splash()
+            self.mode = "video"
+            self.start_pipeline()
+        return False
+
+    def stop_video(self):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+
+    def build_pipeline(self):
+        caps = proto.srtp_caps(proto.unb64(self.config["host"]["key"]))
+        desc = video_pipeline(caps, self.args.latency, self.chains[self.chain], self.sink)
+        log("Pipeline:", desc.replace(caps, "<srtp>"))
+        pipeline = Gst.parse_launch(desc)
+        pipeline.get_by_name("depay").get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self.on_buffer)
+        pipeline.get_by_name("src").get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self.on_packet)
+        pipeline.get_by_name("shown").get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self.on_frame)
+        # srtpdec holt den Schlüssel pro SSRC über dieses Signal, nicht aus den Caps.
+        pipeline.get_by_name("srtp").connect("request-key", lambda _dec, _ssrc: Gst.Caps.from_string(caps))
+        self.watch_bus(pipeline, self.on_error)
+        return pipeline
+
+    def start_pipeline(self):
+        self.last_buffer = 0.0
+        self.last_seq = None
+        self.chain_frames = 0
+        self.video_since = time.monotonic()
+        try:
+            self.pipeline = self.build_pipeline()
+        except GLib.Error as e:
+            log("Pipeline nicht baubar:", e.message)
+            return self.next_chain()
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self.request_keyframe()
+
+    def restart_pipeline(self):
+        self.stop_video()
+        if self.mode == "video":
+            self.start_pipeline()
+        return False
+
+    def next_chain(self):
+        if len(self.chains) > 1:
+            self.chain = (self.chain + 1) % len(self.chains)
+            log("Versuche Ausgabekette:", self.describe(self.chains[self.chain]))
+        GLib.timeout_add_seconds(1, self.restart_pipeline)
+
+    def on_error(self, _bus, msg):
+        err, dbg = msg.parse_error()
+        log("Fehler:", err.message, dbg or "")
+        self.stop_video()
+        if self.chain_frames == 0:
+            self.next_chain()  # diese Kette hat noch nie ein Bild gezeigt
+        else:
+            GLib.timeout_add_seconds(1, self.restart_pipeline)
+
+    def check_video(self):
+        if self.mode != "video" or not self.pipeline:
+            return True
+        now = time.monotonic()
+        # Pakete kommen, aber der Decoder zeigt nichts: er wartet auf einen
+        # Keyframe (z.B. nach dem Start). Den sofort anfordern.
+        if now - self.last_buffer < 1 and now - self.last_frame > 1:
+            self.request_keyframe()
+        if now - max(self.last_buffer, self.video_since) > STALL_TIMEOUT:
+            log("Kein Bild mehr, warte auf Host ...")
+            self.show_splash()
+        elif now - max(self.last_frame, self.video_since) > DECODE_TIMEOUT:
+            log("Pakete ohne Bild - Decoder hängt")
+            self.stop_video()
+            if self.chain_frames == 0:
+                self.next_chain()
+            else:
+                self.restart_pipeline()
+        return True
+
+    def on_packet(self, _pad, info):
+        ok, rtp = GstRtp.RTPBuffer.map(info.get_buffer(), Gst.MapFlags.READ)
+        if ok:
+            seq = rtp.get_seq()
+            rtp.unmap()
+            gap = (seq - self.last_seq - 1) & 0xFFFF if self.last_seq is not None else 0
+            # Große Sprünge sind ein neuer Stream (Host neu gestartet), kein Verlust.
+            if 0 < gap < 1000:
+                self.stats["lost"] += gap
+                GLib.idle_add(self.request_keyframe)
+            self.last_seq = seq
+        self.stats["packets"] += 1
+        return Gst.PadProbeReturn.OK
+
+    def on_buffer(self, _pad, _info):
+        self.last_buffer = time.monotonic()
+        return Gst.PadProbeReturn.OK
+
+    def on_frame(self, _pad, _info):
+        self.stats["frames"] += 1
+        self.chain_frames += 1
+        self.last_frame = time.monotonic()
+        return Gst.PadProbeReturn.OK
+
+    def request_keyframe(self):
+        self.send_beacon(keyframe=True)
+        return False
+
+    def log_stats(self):
+        if self.stats["packets"]:
+            log(f"Statistik 5s: {self.stats['packets']} Pakete, {self.stats['lost']} verloren, "
+                f"{self.stats['frames']} Bilder angezeigt")
+        self.stats = dict.fromkeys(self.stats, 0)
+        return True
+
+    @staticmethod
+    def watch_bus(pipeline, on_error):
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", on_error)
+
+    # --- Protokoll (wie opentop-client) ---------------------------------------
+
+    @property
+    def paired(self):
+        return "host" in self.config
+
+    def send_beacon(self, keyframe=False):
+        now = time.monotonic()
+        if self.pairing and now - self.pairing["started"] > proto.PAIRING_TIMEOUT:
+            log("Kopplung abgelaufen")
+            self.pairing = None
+            self.update_splash()
+        ident = {"id": self.config["id"], "name": self.name}
+        if self.paired and not self.repair:
+            host = self.config["host"]
+            msg = proto.sign({"type": "beacon", **ident, "size": self.size and list(self.size),
+                              "keyframe": keyframe, "host": host["pub"], "seq": time.time_ns()},
+                             proto.unb64(host["key"]))
+        elif self.pairing:
+            msg = {"type": "nonce", "id": self.config["id"], "nonce": self.pairing["nonce"]}
+        elif now >= self.rejected_until:
+            msg = {"type": "hello", **ident, "pub": self.identity.pub}
+        else:
+            return True
+        self.broadcast(proto.encode(msg))
+        return True
+
+    def broadcast(self, data):
+        # Über jedes Interface melden, damit der Host ein direktes Kabel
+        # parallel zum WLAN sieht und bevorzugen kann.
+        for target in self.args.host or broadcast_addresses():
+            try:
+                self.sock.sendto(data, (target, proto.BEACON_PORT))
+            except OSError as e:
+                log(f"Senden an {target} fehlgeschlagen:", e)
+
+    def on_message(self, *_):
+        data, addr = self.sock.recvfrom(2048)
+        msg = proto.decode(data)
+        handler = msg and {"commit": self.on_commit, "reveal": self.on_reveal,
+                           "paired": self.on_paired, "rejected": self.on_rejected,
+                           "unknown": self.on_unknown}.get(msg.get("type"))
+        if handler:
+            try:
+                handler(msg, addr)
+            except (KeyError, TypeError, ValueError) as e:
+                log(f"Ungültige Nachricht von {addr[0]}:", e)
+        return True
+
+    def on_commit(self, msg, addr):
+        if self.pairing or (self.paired and not self.repair):
+            return
+        log(f"Kopplung mit Host {addr[0]} beginnt")
+        self.pairing = {"host_pub": msg["pub"], "commit": msg["commit"],
+                        "nonce": proto.new_nonce(), "started": time.monotonic()}
+        self.send_beacon()
+        self.update_splash()
+
+    def on_reveal(self, msg, _addr):
+        pairing = self.pairing
+        if not pairing or "code" in pairing:
+            return
+        host_pub, host_nonce = pairing["host_pub"], msg["nonce"]
+        if proto.commitment(host_pub, self.identity.pub, host_nonce) != pairing["commit"]:
+            log("Host hat seine Festlegung gebrochen - Kopplung abgebrochen")
+            self.pairing = None
+            return
+        shared = self.identity.shared(host_pub)
+        args = (shared, host_pub, self.identity.pub, pairing["nonce"], host_nonce)
+        pairing["code"] = proto.pairing_code(*args)
+        pairing["key"] = proto.session_key(*args)
+        self.pending_keys = [(host_pub, pairing["key"])] + self.pending_keys[:2]
+        log(f"Kopplungscode {pairing['code']}")
+        self.update_splash()
+
+    def on_paired(self, msg, _addr):
+        # Auch Bestätigungen einer gerade abgelaufenen Kopplung annehmen.
+        for host_pub, key in self.pending_keys:
+            if proto.verify(msg, key):
+                break
+        else:
+            return
+        self.config["host"] = {"pub": host_pub, "name": str(msg["name"])[:64],
+                               "key": proto.b64(key)}
+        proto.save_json(CONFIG_FILE, self.config)
+        log(f"Gekoppelt mit {self.config['host']['name']}")
+        self.pairing = None
+        self.pending_keys = []
+        self.repair = False
+        if self.mode == "video":
+            self.restart_pipeline()  # neuer Schlüssel
+        self.update_splash()
+
+    def on_rejected(self, _msg, _addr):
+        if not self.pairing:
+            return
+        log("Kopplung abgelehnt")
+        self.pairing = None
+        self.rejected_until = time.monotonic() + REJECT_PAUSE
+        self.update_splash()
+
+    def on_unknown(self, _msg, _addr):
+        # Der Host kennt uns nicht (mehr): neu koppeln. Der alte Schlüssel
+        # bleibt, bis die neue Kopplung bestätigt ist.
+        if self.paired and not self.repair:
+            log("Host kennt diesen Client nicht mehr - koppele neu")
+            self.repair = True
+            self.show_splash()
+            self.update_splash()
+
+    # --- Ablauf --------------------------------------------------------------
+
+    def run(self):
+        log("Bildschirm:", f"{self.size[0]}x{self.size[1]}" if self.size else "unbekannt",
+            "| Ausgabeketten:", "; ".join(self.describe(c) for c in self.chains) or "keine")
+        self.keyboard = Keyboard(self.quit, grab=not self.args.no_grab)
+        GLib.io_add_watch(self.sock.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, self.on_message)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.quit)
+        self.show_splash()
+        self.send_beacon()
+        GLib.timeout_add_seconds(1, self.send_beacon)
+        GLib.timeout_add_seconds(5, self.log_stats)
+        GLib.timeout_add_seconds(5, lambda: self.mode != "splash" or self.update_splash())
+        GLib.timeout_add(500, self.tick)
+        GLib.timeout_add(500, self.check_video)
+        try:
+            self.loop.run()
+        finally:
+            self.stop_video()
+            self.stop_splash()
+            self.stop_sniffer()
+            self.keyboard.close()
+            if self.drm_fd is not None:
+                os.close(self.drm_fd)
+
+    def quit(self, *_):
+        self.loop.quit()
+        return False
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--host", action="append",
+                   help="Host-IP direkt anschreiben statt Broadcast (mehrfach möglich, z.B. Tailscale)")
+    p.add_argument("--latency", type=int, default=0,
+                   help="Jitterbuffer in ms, z.B. 30 für WLAN (Standard: 0 = aus)")
+    p.add_argument("--software", action="store_true",
+                   help="Software-Decoder statt VA-API verwenden")
+    p.add_argument("--no-grab", action="store_true",
+                   help="Tastaturen nicht exklusiv belegen")
+    p.add_argument("--sink", default="kmssink",
+                   help="GStreamer-Ausgabe, z.B. 'kmssink connector-id=95' (Standard: kmssink)")
+    args = p.parse_args()
+
+    Gst.init(None)
+    Client(args).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
