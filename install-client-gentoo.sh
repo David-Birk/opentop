@@ -82,7 +82,7 @@ PKGS=(
 # immer selbst bauen. libdrm muss vorher da sein, sonst fehlt kmssink still.
 EMERGE=(emerge --ask --verbose --usepkg-exclude media-libs/gst-plugins-bad)
 echo "==> Pakete installieren"
-"${EMERGE[@]}" --noreplace x11-libs/libdrm
+"${EMERGE[@]}" --oneshot --noreplace x11-libs/libdrm
 "${EMERGE[@]}" --update --newuse "${PKGS[@]}"
 
 if ! gst-inspect-1.0 --exists kmssink 2>/dev/null; then
