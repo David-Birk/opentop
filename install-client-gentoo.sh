@@ -6,7 +6,7 @@
 # direkt über DRM/KMS aus.
 #
 #   ./install-client-gentoo.sh [--va-driver iHD|i965] [--link IFACE] [--user NAME]
-#                              [--software] [--start]
+#                              [--software] [--ac-poweroff] [--start]
 #
 #   --va-driver    VA-API-Treiber für Intel-GPUs (Standard: iHD).
 #                  i965 genügt bis einschließlich Gen9 (Skylake, Apollo Lake,
@@ -16,17 +16,20 @@
 #                  direktes Kabel anlegen (z.B. enp2s0)
 #   --user NAME    Benutzer für den Dienst (Standard: opentop)
 #   --software     zusätzlich Software-Decoder installieren (ffmpeg, groß)
+#   --ac-poweroff  herunterfahren, wenn das Netzteil abgesteckt wird (nach 30 s,
+#                  abbrechbar durch Anstecken oder "opentop-power --cancel")
 #   --start        Dienst sofort starten (übernimmt sofort den Bildschirm)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-LINK_IFACE="" SVC_USER="opentop" SOFTWARE=0 START=0 VA_DRIVER="iHD"
+LINK_IFACE="" SVC_USER="opentop" SOFTWARE=0 START=0 VA_DRIVER="iHD" AC_POWEROFF=0
 while (( $# )); do
     case "$1" in
         --va-driver) VA_DRIVER="$2"; shift ;;
         --link) LINK_IFACE="$2"; shift ;;
         --user) SVC_USER="$2"; shift ;;
         --software) SOFTWARE=1 ;;
+        --ac-poweroff) AC_POWEROFF=1 ;;
         --start) START=1 ;;
         *) echo "Unbekannte Option: $1" >&2; exit 2 ;;
     esac
@@ -155,6 +158,17 @@ if [[ -n $LINK_IFACE ]]; then
     else
         echo "  nmcli fehlt - Link-Local für $LINK_IFACE bitte selbst einrichten." >&2
     fi
+fi
+
+if (( AC_POWEROFF )); then
+    install -Dm755 data/opentop-power /usr/local/sbin/opentop-power
+    install -Dm755 data/opentop-power.openrc /etc/init.d/opentop-power
+    [[ -e /etc/conf.d/opentop-power ]] ||
+        printf '# Sekunden zwischen Abstecken und Herunterfahren\nOPENTOP_POWER_DELAY=30\n' \
+            > /etc/conf.d/opentop-power
+    rc-update add opentop-power default >/dev/null
+    rc-service opentop-power restart >/dev/null
+    echo "  Herunterfahren beim Abstecken aktiv (/etc/conf.d/opentop-power)"
 fi
 
 rc-update add opentop-client default >/dev/null

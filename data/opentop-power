@@ -1,0 +1,54 @@
+#!/bin/sh
+# Netzteil abgesteckt -> nach einer Wartezeit herunterfahren. Der Laptop
+# verhält sich so wie ein Monitor, der mit dem Strom ausgeht.
+#
+# Abbrechen: Netzteil wieder anstecken oder "opentop-power --cancel".
+# Reagiert nur auf den Wechsel angesteckt -> abgesteckt: Wer den Laptop auf
+# Akku einschaltet, kann ihn weiter benutzen.
+
+DELAY="${OPENTOP_POWER_DELAY:-30}"
+CANCEL=/run/opentop-power.cancel
+
+if [ "$1" = --cancel ]; then
+	touch "$CANCEL" && echo "Herunterfahren abgebrochen"
+	exit
+fi
+
+ac=$(grep -lx Mains /sys/class/power_supply/*/type 2>/dev/null | head -n1)
+[ -n "$ac" ] || { echo "Kein Netzteil in /sys/class/power_supply gefunden" >&2; exit 1; }
+online="${ac%/type}/online"
+
+countdown() {
+	rm -f "$CANCEL"
+	echo "Netzteil getrennt - fahre in ${DELAY}s herunter" \
+		"(abbrechen: Netzteil anstecken oder opentop-power --cancel)"
+	i=0
+	while [ "$i" -lt "$DELAY" ]; do
+		sleep 1
+		i=$((i + 1))
+		if [ "$(cat "$online")" = 1 ]; then
+			echo "Netzteil wieder angesteckt - Herunterfahren abgebrochen"
+			return
+		fi
+		if [ -e "$CANCEL" ]; then
+			rm -f "$CANCEL"
+			echo "Herunterfahren per --cancel abgebrochen"
+			return
+		fi
+	done
+	echo "Fahre herunter"
+	poweroff
+}
+
+prev=$(cat "$online")
+udevadm monitor --udev --subsystem-match=power_supply | while read -r _; do
+	cur=$(cat "$online")
+	[ "$prev" = 1 ] && [ "$cur" = 0 ] && countdown
+	prev=$(cat "$online")
+done &
+
+# Beim Stoppen auch udevadm und die Schleife beenden (eigene Prozessgruppe
+# dank start-stop-daemon). Mit wait statt Vordergrund-Pipeline, weil die
+# Shell Traps sonst erst nach deren Ende ausführt.
+trap 'trap - TERM INT; kill 0' TERM INT
+wait

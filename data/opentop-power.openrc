@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+# Herunterfahren, sobald das Netzteil abgesteckt wird (siehe /usr/local/sbin/opentop-power).
+# Wartezeit in Sekunden über OPENTOP_POWER_DELAY in /etc/conf.d/opentop-power.
+
+description="opentop – Herunterfahren beim Abstecken des Netzteils"
+
+export OPENTOP_POWER_DELAY
+
+command="/usr/local/sbin/opentop-power"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_logger="logger -t opentop-power -p user.info"
+error_logger="logger -t opentop-power -p user.err"
+
+depend() {
+	need udev
+	use logger
+}

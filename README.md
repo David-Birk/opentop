@@ -178,6 +178,7 @@ stehen in `/etc/conf.d/opentop-client`.
 | `--link IFACE` | NetworkManager-Profil mit Link-Local-Adresse für ein Kabel      |
 | `--user NAME`  | anderer Benutzer für den Dienst                                |
 | `--software`   | zusätzlich Software-Decoder (ffmpeg) installieren              |
+| `--ac-poweroff` | beim Abstecken des Netzteils nach 30 s herunterfahren; Anstecken oder `opentop-power --cancel` bricht ab |
 | `--start`      | Dienst sofort starten                                          |
 
 `Strg`+`Alt`+`Rücktaste` beendet den Client und gibt Bildschirm und Tastatur
