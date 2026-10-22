@@ -5,8 +5,13 @@
 # kein Rust. Der Client läuft als Systemdienst und gibt das Bild per kmssink
 # direkt über DRM/KMS aus.
 #
-#   ./install-client-gentoo.sh [--link IFACE] [--user NAME] [--software] [--start]
+#   ./install-client-gentoo.sh [--va-driver iHD|i965] [--link IFACE] [--user NAME]
+#                              [--software] [--start]
 #
+#   --va-driver    VA-API-Treiber für Intel-GPUs (Standard: iHD).
+#                  i965 genügt bis einschließlich Gen9 (Skylake, Apollo Lake,
+#                  Kaby Lake, Coffee Lake) und baut in Minuten statt Stunden,
+#                  weil iHD Code für alle Generationen bis Xe3 kompiliert.
 #   --link IFACE   NetworkManager-Profil mit Link-Local-Adresse für ein
 #                  direktes Kabel anlegen (z.B. enp2s0)
 #   --user NAME    Benutzer für den Dienst (Standard: opentop)
@@ -15,9 +20,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-LINK_IFACE="" SVC_USER="opentop" SOFTWARE=0 START=0
+LINK_IFACE="" SVC_USER="opentop" SOFTWARE=0 START=0 VA_DRIVER="iHD"
 while (( $# )); do
     case "$1" in
+        --va-driver) VA_DRIVER="$2"; shift ;;
         --link) LINK_IFACE="$2"; shift ;;
         --user) SVC_USER="$2"; shift ;;
         --software) SOFTWARE=1 ;;
@@ -26,6 +32,12 @@ while (( $# )); do
     esac
     shift
 done
+
+case "${VA_DRIVER,,}" in
+    ihd) VA_PKG=media-libs/libva-intel-media-driver ;;
+    i965) VA_PKG=media-libs/libva-intel-driver ;;
+    *) echo "--va-driver: iHD oder i965" >&2; exit 2 ;;
+esac
 
 [[ $EUID -eq 0 ]] || { echo "Bitte als root ausführen." >&2; exit 1; }
 command -v emerge >/dev/null || { echo "Kein Portage gefunden - das ist kein Gentoo." >&2; exit 1; }
@@ -54,6 +66,8 @@ media-libs/gst-plugins-base introspection pango -egl -gles2 -opengl -gbm -X -way
 media-libs/gst-plugins-bad introspection vaapi -X -wayland -vulkan -vnc
 media-libs/libva -X -wayland -glx
 media-libs/libva-intel-media-driver -X
+media-libs/libva-intel-driver -X -wayland -hybrid
+x11-libs/libdrm video_cards_intel
 dev-python/pygobject -cairo
 x11-libs/cairo -X
 x11-libs/pango -X"
@@ -70,7 +84,7 @@ PKGS=(
     media-libs/gst-plugins-good
     media-libs/gst-plugins-bad
     media-plugins/gst-plugins-srtp
-    media-libs/libva-intel-media-driver
+    "$VA_PKG"
     dev-python/pygobject
     dev-python/pynacl
     media-fonts/dejavu

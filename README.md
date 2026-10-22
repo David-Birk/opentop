@@ -174,6 +174,7 @@ stehen in `/etc/conf.d/opentop-client`.
 
 | Option         | Zweck                                                          |
 |----------------|----------------------------------------------------------------|
+| `--va-driver i965` | älterer Intel-Treiber statt iHD; reicht bis Gen9 (z.B. HD 505) und baut in Minuten statt Stunden |
 | `--link IFACE` | NetworkManager-Profil mit Link-Local-Adresse für ein Kabel      |
 | `--user NAME`  | anderer Benutzer für den Dienst                                |
 | `--software`   | zusätzlich Software-Decoder (ffmpeg) installieren              |
