@@ -110,6 +110,7 @@ class Client:
         self.pending_keys = []
         self.repair = False
         self.rejected_until = 0.0
+        self.roc = None
 
     def run(self):
         self.app = Gtk.Application(application_id="io.github.davidbirk.opentop")
@@ -263,7 +264,7 @@ class Client:
         msg = proto.decode(data)
         handler = msg and {"commit": self.on_commit, "reveal": self.on_reveal,
                            "paired": self.on_paired, "rejected": self.on_rejected,
-                           "unknown": self.on_unknown}.get(msg.get("type"))
+                           "unknown": self.on_unknown, "stream": self.on_stream}.get(msg.get("type"))
         if handler:
             try:
                 handler(msg, addr)
@@ -324,6 +325,10 @@ class Client:
         self.rejected_until = time.monotonic() + REJECT_PAUSE
         self.update_splash()
 
+    def on_stream(self, msg, _addr):
+        if self.paired and proto.verify(msg, proto.unb64(self.config["host"]["key"])):
+            self.roc = int(msg["roc"])
+
     def on_unknown(self, _msg, _addr):
         # Der Host kennt uns nicht (mehr): neu koppeln. Der alte Schlüssel
         # bleibt, bis die neue Kopplung bestätigt ist.
@@ -337,7 +342,7 @@ class Client:
         # B-Frames, und ohne Angabe im Stream (NVENC) würde der Decoder puffern.
         dec = ("vah264dec compliance=flexible" if has_element("vah264dec") and not self.args.software
                else "avdec_h264")
-        caps = proto.srtp_caps(proto.unb64(self.config["host"]["key"]))
+        caps = proto.srtp_caps(proto.unb64(self.config["host"]["key"]), self.roc)
         desc = (f"udpsrc name=src port={proto.STREAM_PORT} buffer-size=4194304 caps=\"{caps}\" ! "
                 "srtpdec name=srtp ! "
                 # Im LAN kommen Pakete in Reihenfolge an; der Jitterbuffer kostet

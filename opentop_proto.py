@@ -193,6 +193,9 @@ def srtp_key(key):
     return hkdf_sha256(key, 30, None, b"opentop srtp")
 
 
-def srtp_caps(key):
+def srtp_caps(key, roc=None):
+    # roc: Rollover-Zähler des Hosts. Ohne ihn nimmt srtpdec 0 an und verwirft
+    # still alle Pakete, sobald der Host schon über 65536 Pakete gesendet hat.
     return ("application/x-srtp,media=video,encoding-name=H264,payload=96,clock-rate=90000,"
-            f"srtp-key=(buffer){srtp_key(key).hex()},{SRTP_PARAMS}")
+            f"srtp-key=(buffer){srtp_key(key).hex()},{SRTP_PARAMS}"
+            + (f",roc=(uint){roc}" if roc is not None else ""))

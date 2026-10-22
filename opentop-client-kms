@@ -257,6 +257,7 @@ class Client:
         self.pending_keys = []
         self.repair = False
         self.rejected_until = 0.0
+        self.roc = None
 
     # --- Anzeige -----------------------------------------------------------
 
@@ -422,7 +423,7 @@ class Client:
             self.pipeline = None
 
     def build_pipeline(self):
-        caps = proto.srtp_caps(proto.unb64(self.config["host"]["key"]))
+        caps = proto.srtp_caps(proto.unb64(self.config["host"]["key"]), self.roc)
         desc = video_pipeline(caps, self.args.latency, self.chains[self.chain], self.sink)
         log("Pipeline:", desc.replace(caps, "<srtp>"))
         pipeline = Gst.parse_launch(desc)
@@ -573,7 +574,7 @@ class Client:
         msg = proto.decode(data)
         handler = msg and {"commit": self.on_commit, "reveal": self.on_reveal,
                            "paired": self.on_paired, "rejected": self.on_rejected,
-                           "unknown": self.on_unknown}.get(msg.get("type"))
+                           "unknown": self.on_unknown, "stream": self.on_stream}.get(msg.get("type"))
         if handler:
             try:
                 handler(msg, addr)
@@ -632,6 +633,10 @@ class Client:
         self.pairing = None
         self.rejected_until = time.monotonic() + REJECT_PAUSE
         self.update_splash()
+
+    def on_stream(self, msg, _addr):
+        if self.paired and proto.verify(msg, proto.unb64(self.config["host"]["key"])):
+            self.roc = int(msg["roc"])
 
     def on_unknown(self, _msg, _addr):
         # Der Host kennt uns nicht (mehr): neu koppeln. Der alte Schlüssel

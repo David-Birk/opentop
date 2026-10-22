@@ -74,6 +74,8 @@ class Pacer:
         self.port = proto.STREAM_PORT
         self.queue = queue.Queue()
         self.max_wait = 0.0      # längste Wartezeit in der Queue seit letzter Statistik
+        self.roc = 0             # SRTP-Rollover-Zähler: Überläufe der RTP-Sequenznummer
+        self.last_seq = None
         self.max_pipeline = 0.0  # längste Zeit Capture -> appsink seit letzter Statistik
         self.captured = collections.deque(maxlen=64)  # Zeitpunkte, zu denen Bilder in den Encoder gingen
         self.last_pts = None
@@ -112,6 +114,11 @@ class Pacer:
                 time.sleep((len(data) - tokens) / rate)
                 tokens, last = len(data), time.perf_counter()
             tokens -= len(data)
+            # Der RTP-Header bleibt bei SRTP unverschlüsselt.
+            seq = int.from_bytes(data[2:4], "big")
+            if self.last_seq is not None and seq < self.last_seq - 0x8000:
+                self.roc += 1
+            self.last_seq = seq
             try:
                 self.sock.sendto(data, (self.ip, self.port))
             except OSError:
@@ -376,6 +383,10 @@ class Host:
             return
         session.last_seq = msg["seq"]
         session.on_beacon(msg, addr[0])
+        if session.pipeline and addr[0] == session.ip:
+            # Ein neu startender Client braucht den Rollover-Zähler, sonst
+            # kann er nach 65536 Paketen nichts mehr entschlüsseln.
+            self.send(proto.sign({"type": "stream", "roc": session.pacer.roc}, session.key), addr)
 
     def on_hello(self, msg, addr):
         info = self.load_clients().get(msg["id"])
